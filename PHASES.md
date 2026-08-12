@@ -1,74 +1,75 @@
 # VOXOPS — Master Phase Roadmap & Tracker
 
 > **Phase Tracking & Progress Register**  
-> *Track all development phases, milestones, and deliverables for VOXOPS.*
+> *Track all development phases, milestones, and deliverables for VOXOPS & VoxGuard.*
 
 ---
 
 ## 📌 Phase Overview & Status Summary
 
-- [ ] **Phase 0: Environment Setup, Free API Keys & Supabase Database Configuration**
-- [ ] **Phase 1: Project Skeleton & Clean Architecture Setup (FastAPI)**
-- [ ] **Phase 2: Database Layer & Supabase Integration (Async SQLAlchemy / SQLModel)**
-- [ ] **Phase 3: Speech-to-Text Ingestion Engine (Groq Whisper v3 Integration)**
-- [ ] **Phase 4: Agentic Reasoning & LLM Engine (DeepSeek-R1 / Qwen 2.5 72B via Groq + Gemini 2.5 Flash)**
+- [x] **Phase 0: Environment Setup, Free API Keys & Supabase Database Configuration**
+- [x] **Phase 1: Project Skeleton & Clean Architecture Setup (FastAPI)**
+- [x] **Phase 2: Database Layer & Supabase Integration (Async SQLAlchemy / SQLModel / psycopg3)**
+- [/] **Phase 3: Speech-to-Text Ingestion Engine (Groq Whisper, Sarvam Saarika, Deepgram)**
+- [ ] **Phase 4: VoxGuard Recovery Engine & LangGraph State Machine (LangSmith Tracing)**
 - [ ] **Phase 5: Vector Memory & Similarity Search (PgVector + Supabase)**
-- [ ] **Phase 6: Core API Endpoints & SSE Streaming (FastAPI Routers)**
-- [ ] **Phase 7: Comprehensive Testing & Security Audit**
-- [ ] **Phase 8: Docker, CI/CD & Production DevOps Deployment**
+- [ ] **Phase 6: Core API Endpoints & WebSockets / SSE Streaming (FastAPI Routers)**
+- [ ] **Phase 7: Next.js Frontend Dashboard & WebRTC Audio Stream**
+- [ ] **Phase 8: Comprehensive Testing, Security Audit & Production DevOps Deployment**
 
 ---
 
 ## 📅 Detailed Phase Breakdown
 
-### Phase 0: Setup & Prerequisites `[ ]`
-- [ ] Obtain Groq API Key (Free tier for DeepSeek-R1, Qwen 2.5 72B, Whisper v3)
-- [ ] Obtain Google AI Studio API Key (Free tier for Gemini 2.5 Flash)
-- [ ] Create Supabase Project (PostgreSQL DB + PgVector extension)
-- [ ] Create `.env` file with credentials
-- [ ] Verify local Python 3.11 environment & install virtual environment (`venv`)
+### Phase 0: Setup & Prerequisites `[x]`
+- [x] Obtain Groq API Key (Free tier for DeepSeek-R1, Qwen 2.5 72B, Whisper v3)
+- [x] Obtain Google AI Studio API Key (Free tier for Gemini 2.5 Flash)
+- [x] Obtain Sarvam AI, ElevenLabs, Deepgram, and LangSmith API Keys
+- [x] Create Supabase Project (`https://bfnuywnumwtuptcggacq.supabase.co`)
+- [x] Create `.env` file with all credentials
+- [x] Verify local Python 3.14 environment
 
-### Phase 1: Core FastAPI Project Skeleton `[ ]`
-- [ ] Setup `pyproject.toml` / `requirements.txt`
-- [ ] Establish clean architecture directory structure (`app/core`, `app/api`, `app/db`, `app/services`, `app/models`, `app/schemas`)
-- [ ] Implement global configuration (`app/core/config.py`) using Pydantic Settings
-- [ ] Create standard CORS & Error Handling Middleware
-- [ ] Implement `/health` check API endpoint
+### Phase 1: Core FastAPI Project Skeleton `[x]`
+- [x] Setup `pyproject.toml` / `requirements.txt`
+- [x] Establish clean architecture directory structure (`app/core`, `app/api`, `app/db`, `app/services`, `app/models`, `app/schemas`)
+- [x] Implement global configuration (`app/core/config.py`) using Pydantic Settings
+- [x] Create standard CORS & Error Handling Middleware
+- [x] Implement `/health` check API endpoint
 
-### Phase 2: Database Layer & Models `[ ]`
-- [ ] Configure Async SQLAlchemy / SQLModel engine connected to Supabase PostgreSQL
-- [ ] Define database models (`User`, `VoiceSession`, `AgentExecution`, `EmbeddingMemory`)
-- [ ] Write database migration scripts / SQL init schemas
-- [ ] Add CRUD repository services with async support
+### Phase 2: Database Layer & Models `[x]`
+- [x] Add `psycopg[binary,pool]` to `requirements.txt`
+- [x] Configure Async SQLAlchemy / SQLModel engine connected to Supabase PostgreSQL (`app/db/session.py`)
+- [x] Define SQLModel database models (`User`, `VoiceSession`, `AgentExecution`, `EmbeddingMemory`)
+- [x] Build CRUD repository services with async support (`app/db/repository.py`)
+- [x] Write database init scripts & pytest suite (`tests/test_db.py`)
 
-### Phase 3: Speech-to-Text Engine `[ ]`
-- [ ] Create Groq Client wrapper for audio processing (`app/services/groq_service.py`)
-- [ ] Implement audio upload & validation service
+### Phase 3: Speech-to-Text Engine `[/]`
+- [/] Create Groq Client wrapper for audio processing (`app/services/groq_service.py`)
+- [ ] Implement Sarvam Saarika & Deepgram Nova-2 STT fallbacks
 - [ ] Support audio format conversion (`.wav`, `.mp3`, `.m4a`, `.webm`)
 - [ ] Implement transcription pipeline with metadata (duration, word count)
 
-### Phase 4: Agentic AI Reasoning Engine `[ ]`
-- [ ] Implement LLM Provider Interface supporting Groq (DeepSeek-R1 / Qwen 2.5 72B) and Google AI Studio (Gemini Flash)
-- [ ] Build Agent State Machine and Tool Calling framework
-- [ ] Implement Structured Outputs using Pydantic v2 schemas
-- [ ] Add fallback mechanism (Groq -> Gemini AI Studio) if rate limits occur
+### Phase 4: VoxGuard Recovery & LangGraph Engine `[ ]`
+- [ ] Implement LangGraph state machine (`Greeting` -> `Intent` -> `Slots` -> `Tool Execution`)
+- [ ] Integrate LangSmith tracing and observability
+- [ ] Build Tool Latency Filler Generator (>1.5s silence handling)
+- [ ] Implement Interruption / Barge-in cancellation engine
 
 ### Phase 5: Memory & Vector Search Layer `[ ]`
-- [ ] Implement embedding generator service (using free text-embedding model / API)
+- [ ] Implement embedding generator service
 - [ ] Integrate Supabase `pgvector` store for semantic session search
-- [ ] Create context retrieval chain for RAG (Retrieval-Augmented Generation)
+- [ ] Create context retrieval chain for RAG
 
-### Phase 6: Production API Endpoints & SSE Streaming `[ ]`
+### Phase 6: Production API Endpoints & WebSockets `[ ]`
 - [ ] `/api/v1/audio/transcribe` endpoint with background processing
-- [ ] `/api/v1/agent/run` endpoint with Server-Sent Events (SSE) streaming progress
+- [ ] `/api/v1/agent/run` WebSockets endpoint with real-time audio & recovery streaming
 - [ ] `/api/v1/sessions` CRUD endpoints
 - [ ] `/api/v1/memory/search` semantic search endpoint
 
-### Phase 7: Testing & Security Audit `[ ]`
-- [ ] Write Unit Tests for services (pytest)
-- [ ] Write Integration Tests for API endpoints (HTTPX Async Client)
-- [ ] Perform OWASP security audit (API security, SQL injection protection, environment variable validation)
-- [ ] Conduct performance benchmarking & memory leak audit
+### Phase 7: Next.js / React Frontend Dashboard `[ ]`
+- [ ] Create WebRTC Microphone & Speaker component
+- [ ] Build real-time Audio Waveform visualizer
+- [ ] Build LangSmith Trace Viewer & Turn-by-Turn Replay Debugger
 
 ### Phase 8: Production Deployment & DevOps `[ ]`
 - [ ] Write `Dockerfile` and `docker-compose.yml`
@@ -82,4 +83,6 @@
 
 | Phase | Completion Date | Git Commit Hash | Notes |
 | :--- | :--- | :--- | :--- |
-| **Phase 0** | *In Progress* | - | Prerequisites & initial plan |
+| **Phase 0** | 2026-08-12 | Initial | Prerequisites & environment setup complete |
+| **Phase 1** | 2026-08-12 | Initial | FastAPI skeleton & health check passing |
+| **Phase 2** | 2026-08-12 | Milestone 2 | Supabase Async DB Engine, psycopg3 & SQLModel models passing 100% |
