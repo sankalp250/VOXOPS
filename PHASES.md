@@ -10,8 +10,8 @@
 - [x] **Phase 0: Environment Setup, Free API Keys & Supabase Database Configuration**
 - [x] **Phase 1: Project Skeleton & Clean Architecture Setup (FastAPI)**
 - [x] **Phase 2: Database Layer & Supabase Integration (Async SQLAlchemy / SQLModel / psycopg3)**
-- [/] **Phase 3: Speech-to-Text Ingestion Engine (Groq Whisper, Sarvam Saarika, Deepgram)**
-- [ ] **Phase 4: VoxGuard Recovery Engine & LangGraph State Machine (LangSmith Tracing)**
+- [x] **Phase 3: Speech-to-Text Ingestion Engine (Groq Whisper, Sarvam Saarika, Deepgram)**
+- [/] **Phase 4: VoxGuard Recovery Engine & LangGraph State Machine (LangSmith Tracing)**
 - [ ] **Phase 5: Vector Memory & Similarity Search (PgVector + Supabase)**
 - [ ] **Phase 6: Core API Endpoints & WebSockets / SSE Streaming (FastAPI Routers)**
 - [ ] **Phase 7: Next.js Frontend Dashboard & WebRTC Audio Stream**
@@ -43,14 +43,15 @@
 - [x] Build CRUD repository services with async support (`app/db/repository.py`)
 - [x] Write database init scripts & pytest suite (`tests/test_db.py`)
 
-### Phase 3: Speech-to-Text Engine `[/]`
-- [/] Create Groq Client wrapper for audio processing (`app/services/groq_service.py`)
-- [ ] Implement Sarvam Saarika & Deepgram Nova-2 STT fallbacks
-- [ ] Support audio format conversion (`.wav`, `.mp3`, `.m4a`, `.webm`)
-- [ ] Implement transcription pipeline with metadata (duration, word count)
+### Phase 3: Speech-to-Text Engine `[x]`
+- [x] Create Groq Client wrapper for audio processing (`app/services/stt_service.py`)
+- [x] Implement Sarvam Saarika & Deepgram Nova-2 STT fallbacks
+- [x] Support audio format validation (`.wav`, `.mp3`, `.m4a`, `.webm`, `.ogg`)
+- [x] Implement `/api/v1/audio/transcribe` endpoint logging telemetry to Supabase
+- [x] Write automated integration tests (`tests/test_stt.py`) passing 100%
 
-### Phase 4: VoxGuard Recovery & LangGraph Engine `[ ]`
-- [ ] Implement LangGraph state machine (`Greeting` -> `Intent` -> `Slots` -> `Tool Execution`)
+### Phase 4: VoxGuard Recovery & LangGraph Engine `[/]`
+- [/] Implement LangGraph state machine (`Greeting` -> `Intent` -> `Slots` -> `Tool Execution`)
 - [ ] Integrate LangSmith tracing and observability
 - [ ] Build Tool Latency Filler Generator (>1.5s silence handling)
 - [ ] Implement Interruption / Barge-in cancellation engine
@@ -86,3 +87,4 @@
 | **Phase 0** | 2026-08-12 | Initial | Prerequisites & environment setup complete |
 | **Phase 1** | 2026-08-12 | Initial | FastAPI skeleton & health check passing |
 | **Phase 2** | 2026-08-12 | Milestone 2 | Supabase Async DB Engine, psycopg3 & SQLModel models passing 100% |
+| **Phase 3** | 2026-08-13 | Milestone 3 | Multi-Provider STT Engine (Groq, Sarvam, Deepgram) passing 100% |

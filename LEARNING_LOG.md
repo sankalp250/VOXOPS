@@ -17,9 +17,18 @@
 ## Milestone 2: Async Database Engine & Supabase Integration (Phase 2 Completed)
 
 ### 💡 Core Concepts Learned
-1. **Async Database ORM (SQLModel & SQLAlchemy 2.0)**: Why non-blocking database I/O using `asyncpg` or `psycopg3` (`psycopg[binary,pool]`) is essential in high-concurrency voice AI gateways.
+1. **Async Database ORM (SQLAlchemy 2.0)**: Why non-blocking database I/O using `asyncpg` or `psycopg3` (`psycopg[binary,pool]`) is essential in high-concurrency voice AI gateways.
 2. **Database Telemetry Modeling**: Structuring `VoiceSession` and `AgentExecution` tables to record real-time turn-taking latency (`turn_latency_ms`), interruption counts (`interruption_count`), filler generation counts (`filler_count`), and safety verdicts (`guardrail_verdict`).
 3. **Pytest Async Fixture Design**: Using `@pytest_asyncio.fixture` with in-memory SQLite (`sqlite+aiosqlite:///:memory:`) for isolated, ultra-fast unit testing.
+
+---
+
+## Milestone 3: Multi-Provider Speech-to-Text Engine (Phase 3 Completed)
+
+### 💡 Core Concepts Learned
+1. **Resilient Provider Fallback Chain**: Implementing auto-failover across **Groq Whisper Large v3** (Primary Free), **Sarvam Saarika** (Indian Regional & Code-Mixing), and **Deepgram Nova-2** (Enterprise fallback).
+2. **Async Audio Ingestion**: Validating audio binary payloads (`.wav`, `.mp3`, `.webm`, `.ogg`) and logging duration, word count, and processing latency directly to Supabase PostgreSQL.
+3. **FastAPI File Uploads & HTTPX Async Client**: Efficiently reading `UploadFile` streams and sending non-blocking requests to external AI APIs.
 
 ### 🛠️ Git & GitHub Learning
 
@@ -28,11 +37,11 @@
 # Check working directory status
 git status
 
-# Stage all Phase 2 database implementation files
+# Stage all Phase 3 STT implementation files
 git add .
 
 # Create a conventional commit
-git commit -m "feat: implement Async Supabase DB layer with SQLModel, psycopg3, and pytest suite"
+git commit -m "feat: implement Multi-Provider STT Engine with Groq Whisper, Sarvam Saarika, and Deepgram Nova-2"
 
 # Push to main branch on GitHub
 git push origin main
@@ -41,6 +50,6 @@ git push origin main
 #### Equivalent VS Code Source Control UI Workflow
 1. Open **Source Control** view (`Ctrl+Shift+G`).
 2. Click **`+` (Stage All Changes)** above the file tree.
-3. Type `"feat: implement Async Supabase DB layer..."` in the commit input box.
+3. Type `"feat: implement Multi-Provider STT Engine..."` in the commit input box.
 4. Press **`Ctrl+Enter`** or click **Commit**.
 5. Click **Sync Changes** or ellipsis **`...` -> Push**.
