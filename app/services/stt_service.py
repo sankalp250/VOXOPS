@@ -1,105 +1,169 @@
+"""
+Multi-Provider Resilient Speech-to-Text (STT) Engine.
+
+Handles automatic zero-downtime failover between:
+1. Groq Whisper Large v3  (Primary - Free & Ultra-fast)
+2. Sarvam Saarika         (Primary for Indian languages & code-mixing)
+3. Deepgram Nova-2        (Enterprise fallback - $200 free credit)
+"""
 import time
 import logging
 from typing import Tuple, Optional
+
 import httpx
-from groq import AsyncGroq
-from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Lazy import guard so Pyrefly / Pylance never complain about missing stubs
+try:
+    from groq import AsyncGroq as _AsyncGroq
+    _GROQ_AVAILABLE = True
+except ImportError:
+    _AsyncGroq = None  # type: ignore[assignment, misc]
+    _GROQ_AVAILABLE = False
+
+from app.core.config import settings
+
 
 class STTProviderError(Exception):
-    """Custom exception raised when an STT provider fails."""
+    """Custom exception raised when an STT provider fails or is unavailable."""
     pass
 
 
 class MultiProviderSTTService:
     """
-    Enterprise Multi-Provider Resilient Speech-to-Text (STT) Engine.
-    Handles automatic zero-downtime failover between Groq Whisper, Sarvam Saarika, and Deepgram Nova-2.
+    Enterprise Multi-Provider Resilient Speech-to-Text Engine.
+
+    Provider priority is determined at call time based on language_code and
+    preferred_provider, with automatic sequential fallback to the next provider
+    on any error so the caller never sees a hard failure.
     """
 
-    def __init__(self):
-        self.groq_client: Optional[AsyncGroq] = None
-        if settings.GROQ_API_KEY:
+    def __init__(self) -> None:
+        self._groq_client: Optional[object] = None
+        if _GROQ_AVAILABLE and settings.GROQ_API_KEY:
             try:
-                self.groq_client = AsyncGroq(api_key=settings.GROQ_API_KEY)
-            except Exception as e:
-                logger.error(f"Failed to initialize Groq client: {e}")
+                self._groq_client = _AsyncGroq(api_key=settings.GROQ_API_KEY)  # type: ignore[call-arg]
+            except Exception as exc:
+                logger.warning("Groq client init failed: %s", exc)
 
-    async def transcribe_groq(self, file_bytes: bytes, filename: str, language: str = "en") -> str:
+    # ------------------------------------------------------------------
+    # Provider Implementations
+    # ------------------------------------------------------------------
+
+    async def transcribe_groq(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        language: str = "en",
+    ) -> str:
         """
-        Transcribes audio using Groq Whisper Large v3 (Ultra-fast & 100% Free).
+        Transcribes audio using Groq Whisper Large v3.
+        Free tier — up to 7200 audio-minutes / day.
         """
-        if not self.groq_client:
-            raise STTProviderError("Groq API Key not configured")
+        if not settings.GROQ_API_KEY:
+            raise STTProviderError("GROQ_API_KEY not set in .env")
+        if not _GROQ_AVAILABLE:
+            raise STTProviderError("groq package not installed (pip install groq)")
+
+        # Re-initialise client lazily in case __init__ failed
+        if self._groq_client is None:
+            try:
+                self._groq_client = _AsyncGroq(api_key=settings.GROQ_API_KEY)  # type: ignore[call-arg]
+            except Exception as exc:
+                raise STTProviderError(f"Cannot create Groq client: {exc}") from exc
 
         try:
-            logger.info("Executing STT via Groq Whisper Large v3...")
-            transcription = await self.groq_client.audio.transcriptions.create(
+            logger.info("STT → Groq Whisper Large v3")
+            transcription = await self._groq_client.audio.transcriptions.create(  # type: ignore[union-attr]
                 file=(filename, file_bytes),
                 model="whisper-large-v3",
                 response_format="json",
-                language=language if language != "auto" else None,
+                language=language if language not in ("auto", "en") else None,
             )
-            return transcription.text
-        except Exception as e:
-            logger.warning(f"Groq STT failed: {e}")
-            raise STTProviderError(f"Groq STT error: {e}")
+            return str(transcription.text)
+        except Exception as exc:
+            logger.warning("Groq STT failed: %s", exc)
+            raise STTProviderError(f"Groq STT error: {exc}") from exc
 
-    async def transcribe_sarvam(self, file_bytes: bytes, filename: str, language: str = "hi-IN") -> str:
+    async def transcribe_sarvam(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        language: str = "hi-IN",
+    ) -> str:
         """
-        Transcribes audio using Sarvam Saarika (Specialized for Indian Languages & Code-Mixing).
+        Transcribes audio using Sarvam Saarika v1.
+        Best for Indian regional languages, Hinglish, Tanglish, code-mixing.
         """
         if not settings.SARVAM_API_KEY:
-            raise STTProviderError("Sarvam API Key not configured")
+            raise STTProviderError("SARVAM_API_KEY not set in .env")
 
-        url = "https://api.sarvam.ai/speech-to-text"
+        # Sarvam expects BCP-47 codes like hi-IN; normalise short codes
+        lang_code = language if "-" in language else f"{language}-IN"
         headers = {"api-subscription-key": settings.SARVAM_API_KEY}
         files = {"file": (filename, file_bytes, "audio/wav")}
-        data = {"model": "saarika:v1", "language_code": language}
+        data = {"model": "saarika:v1", "language_code": lang_code}
 
         try:
-            logger.info("Executing STT via Sarvam Saarika...")
+            logger.info("STT → Sarvam Saarika (%s)", lang_code)
             async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(url, headers=headers, files=files, data=data)
-                if response.status_code == 200:
-                    res_data = response.json()
-                    return res_data.get("transcript", "")
-                else:
-                    raise STTProviderError(f"Sarvam API returned {response.status_code}: {response.text}")
-        except Exception as e:
-            logger.warning(f"Sarvam STT failed: {e}")
-            raise STTProviderError(f"Sarvam STT error: {e}")
+                resp = await client.post(
+                    "https://api.sarvam.ai/speech-to-text",
+                    headers=headers,
+                    files=files,
+                    data=data,
+                )
+            if resp.status_code == 200:
+                return str(resp.json().get("transcript", ""))
+            raise STTProviderError(f"Sarvam HTTP {resp.status_code}: {resp.text}")
+        except STTProviderError:
+            raise
+        except Exception as exc:
+            logger.warning("Sarvam STT failed: %s", exc)
+            raise STTProviderError(f"Sarvam STT error: {exc}") from exc
 
-    async def transcribe_deepgram(self, file_bytes: bytes, filename: str, language: str = "en") -> str:
+    async def transcribe_deepgram(
+        self,
+        file_bytes: bytes,
+        filename: str,  # noqa: ARG002
+        language: str = "en",
+    ) -> str:
         """
-        Transcribes audio using Deepgram Nova-2 ($200 Free Credit Enterprise STT).
+        Transcribes audio using Deepgram Nova-2.
+        Enterprise-grade accuracy; $200 free credit on sign-up.
         """
         if not settings.DEEPGRAM_API_KEY:
-            raise STTProviderError("Deepgram API Key not configured")
+            raise STTProviderError("DEEPGRAM_API_KEY not set in .env")
 
-        url = f"https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&language={language}"
+        url = (
+            f"https://api.deepgram.com/v1/listen"
+            f"?model=nova-2&smart_format=true&language={language}"
+        )
         headers = {
             "Authorization": f"Token {settings.DEEPGRAM_API_KEY}",
             "Content-Type": "audio/wav",
         }
 
         try:
-            logger.info("Executing STT via Deepgram Nova-2...")
+            logger.info("STT → Deepgram Nova-2 (%s)", language)
             async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(url, headers=headers, content=file_bytes)
-                if response.status_code == 200:
-                    res_data = response.json()
-                    channels = res_data.get("results", {}).get("channels", [])
-                    if channels and channels[0].get("alternatives"):
-                        return channels[0]["alternatives"][0].get("transcript", "")
-                    return ""
-                else:
-                    raise STTProviderError(f"Deepgram API returned {response.status_code}: {response.text}")
-        except Exception as e:
-            logger.warning(f"Deepgram STT failed: {e}")
-            raise STTProviderError(f"Deepgram STT error: {e}")
+                resp = await client.post(url, headers=headers, content=file_bytes)
+            if resp.status_code == 200:
+                channels = resp.json().get("results", {}).get("channels", [])
+                if channels and channels[0].get("alternatives"):
+                    return str(channels[0]["alternatives"][0].get("transcript", ""))
+                return ""
+            raise STTProviderError(f"Deepgram HTTP {resp.status_code}: {resp.text}")
+        except STTProviderError:
+            raise
+        except Exception as exc:
+            logger.warning("Deepgram STT failed: %s", exc)
+            raise STTProviderError(f"Deepgram STT error: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # Fallback Orchestrator
+    # ------------------------------------------------------------------
 
     async def transcribe_with_fallback(
         self,
@@ -109,42 +173,53 @@ class MultiProviderSTTService:
         language_code: str = "en",
     ) -> Tuple[str, str, int]:
         """
-        Executes transcription using preferred provider with automatic failover chain.
-        Returns: (transcript_text, provider_used, latency_ms)
-        """
-        start_time = time.time()
-        indian_languages = ["hi", "ta", "te", "kn", "bn", "mr", "gu", "pa", "ml"]
+        Execute transcription with automatic zero-downtime provider failover.
 
-        # Provider execution order determination
-        providers = []
-        if preferred_provider == "sarvam" or (preferred_provider == "auto" and language_code in indian_languages):
+        Returns:
+            Tuple of (transcript_text, provider_used, latency_ms)
+        """
+        t0 = time.monotonic()
+
+        # Languages where Sarvam outperforms Groq
+        _indian_codes = {"hi", "ta", "te", "kn", "bn", "mr", "gu", "pa", "ml", "or", "as"}
+        _is_indian = language_code.split("-")[0] in _indian_codes
+
+        # Build ordered provider chain
+        _all = [
+            ("groq", self.transcribe_groq),
+            ("sarvam", self.transcribe_sarvam),
+            ("deepgram", self.transcribe_deepgram),
+        ]
+
+        if preferred_provider == "sarvam" or (preferred_provider == "auto" and _is_indian):
             providers = [("sarvam", self.transcribe_sarvam), ("groq", self.transcribe_groq), ("deepgram", self.transcribe_deepgram)]
         elif preferred_provider == "deepgram":
             providers = [("deepgram", self.transcribe_deepgram), ("groq", self.transcribe_groq), ("sarvam", self.transcribe_sarvam)]
         elif preferred_provider == "groq":
             providers = [("groq", self.transcribe_groq), ("sarvam", self.transcribe_sarvam), ("deepgram", self.transcribe_deepgram)]
         else:
-            # Default auto routing for English and other languages
-            providers = [("groq", self.transcribe_groq), ("sarvam", self.transcribe_sarvam), ("deepgram", self.transcribe_deepgram)]
+            # Default: Groq first for English, Sarvam first for Indian
+            providers = _all
 
-        last_error = None
-        for name, func in providers:
+        last_error: Optional[Exception] = None
+        for name, fn in providers:
             try:
-                transcript = await func(file_bytes, filename, language=language_code)
+                transcript = await fn(file_bytes, filename, language=language_code)
                 if transcript and transcript.strip():
-                    latency_ms = int((time.time() - start_time) * 1000)
-                    logger.info(f"STT succeeded using '{name}' in {latency_ms}ms.")
-                    return transcript.strip(), name, latency_ms
-            except STTProviderError as e:
-                last_error = e
-                logger.warning(f"STT provider '{name}' failed, trying next fallback...")
-                continue
+                    ms = int((time.monotonic() - t0) * 1000)
+                    logger.info("STT ✓ '%s' in %dms", name, ms)
+                    return transcript.strip(), name, ms
+            except STTProviderError as exc:
+                last_error = exc
+                logger.warning("Provider '%s' failed → trying next. Reason: %s", name, exc)
 
-        # If all providers fail or are unconfigured, return mock/fallback notice for testing resiliency
-        latency_ms = int((time.time() - start_time) * 1000)
-        logger.error(f"All STT providers failed. Last error: {last_error}")
-        return "Audio received. (STT Fallback: No active key responded)", "mock_fallback", latency_ms
+        # All providers failed — return graceful degradation response
+        ms = int((time.monotonic() - t0) * 1000)
+        logger.error("All STT providers failed. Last: %s", last_error)
+        return "[Transcription unavailable — all STT providers failed]", "none", ms
 
 
-# Global singleton instance
+# ---------------------------------------------------------------------------
+# Module-level singleton (import this anywhere in the app)
+# ---------------------------------------------------------------------------
 stt_service = MultiProviderSTTService()
