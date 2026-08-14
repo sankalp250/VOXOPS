@@ -1,398 +1,385 @@
-import React, { useState, useEffect, useRef } from "react";
-import { Mic, MicOff, Send, Volume2, ShieldAlert, Zap, Radio, PhoneOff } from "lucide-react";
-import { api } from "../services/api";
+import React, { useState, useRef, useEffect } from 'react';
+import { 
+  Mic, MicOff, Send, Volume2, ShieldAlert, ShieldCheck, Clock, 
+  Activity, Sparkles, AlertTriangle, Play, Pause, RotateCcw, Hand
+} from 'lucide-react';
+import { runAgentTurn, transcribeAudio } from '../services/api';
 
-/**
- * MENTOR LESSON: useRef vs useState in Real-Time Voice Applications
- *
- * ❓ Common Interview Question: "Why do we use useRef for WebSockets & Audio elements instead of useState?"
- *
- * 💡 Answer:
- * 1. `useState` triggers a full component re-render every time its value changes.
- * 2. An active WebSocket or Audio stream must NOT be torn down and recreated every time a button is clicked or text is typed!
- * 3. `useRef` provides a stable, mutable container that persists across re-renders without causing unwanted UI re-renders.
- */
 export default function VoicePlayground({ activeClient }) {
-  const [messages, setMessages] = useState([]);
-  const [inputText, setInputText] = useState("");
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [currentFiller, setCurrentFiller] = useState(null);
-  const [isPlayingAudio, setIsPlayingAudio] = useState(false);
-  const [wsConnected, setWsConnected] = useState(false);
+  const [transcriptInput, setTranscriptInput] = useState('');
+  const [messages, setMessages] = useState([
+    {
+      role: 'assistant',
+      text: activeClient ? `Hello! I am ${activeClient.name}'s voice assistant. How can I help you today?` : 'Please select or create a client tenant to begin voice testing.',
+      turn_latency_ms: 120,
+      guardrail_flag: false,
+      intent: 'welcome',
+      slots: {},
+    }
+  ]);
+  const [loading, setLoading] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [fillerActive, setFillerActive] = useState(false);
+  const [audioPlaying, setAudioPlaying] = useState(false);
+  const [lastExecutionState, setLastExecutionState] = useState(null);
 
-  // Mutable references for persistent instances
-  const audioRef = useRef(null);
-  const wsRef = useRef(null);
-  const messagesEndRef = useRef(null);
+  // Audio Recording Refs
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const chatBottomRef = useRef(null);
 
-  // Initialize audio element
   useEffect(() => {
-    audioRef.current = new Audio();
-    audioRef.current.onplay = () => setIsPlayingAudio(true);
-    audioRef.current.onended = () => setIsPlayingAudio(false);
-    audioRef.current.onpause = () => setIsPlayingAudio(false);
+    chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, fillerActive]);
 
-    return () => {
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current = null;
-      }
-    };
-  }, []);
-
-  // Connect to WebSocket when active client changes
   useEffect(() => {
-    if (!activeClient) return;
-
-    const wsUrl = `ws://localhost:8000/api/v1/ws/voice?client_id=${activeClient.id}`;
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      setWsConnected(true);
-      console.log("Connected to VoxOps WebSocket Gateway");
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        handleWebSocketMessage(data);
-      } catch (e) {
-        console.error("Failed to parse WS message:", e);
-      }
-    };
-
-    ws.onclose = () => {
-      setWsConnected(false);
-      console.log("WebSocket Disconnected");
-    };
-
-    // Cleanup on unmount or client switch
-    return () => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.close();
-      }
-    };
+    if (activeClient) {
+      setMessages([
+        {
+          role: 'assistant',
+          text: `Connected to ${activeClient.name} (${activeClient.language_code}). How can I help?`,
+          turn_latency_ms: 80,
+          guardrail_flag: false,
+          intent: 'welcome',
+          slots: {},
+        }
+      ]);
+    }
   }, [activeClient]);
 
-  // Scroll to bottom when new messages arrive
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, currentFiller]);
+  // Handle Text Submission
+  async function handleSend(textToSend) {
+    const text = (textToSend || transcriptInput).trim();
+    if (!text || !activeClient) return;
 
-  // Handle incoming WebSocket frames
-  const handleWebSocketMessage = (data) => {
-    if (data.type === "filler") {
-      setCurrentFiller(data.text);
-      if (data.audio_base64) {
-        playBase64Audio(data.audio_base64);
-      }
-    } else if (data.type === "agent_response") {
-      setCurrentFiller(null);
-      setIsProcessing(false);
+    // 1. Append User Message
+    const userMsg = { role: 'user', text };
+    setMessages(prev => [...prev, userMsg]);
+    setTranscriptInput('');
+    setLoading(true);
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          text: data.response_text,
-          intent: data.intent,
-          slots: data.slots,
-          latency: data.turn_latency_ms,
-          guardrail: data.guardrail_flag,
-          timestamp: new Date().toLocaleTimeString(),
-        },
-      ]);
+    // Simulate VoxGuard Filler Phrase if response takes > 1.2s
+    const fillerTimer = setTimeout(() => {
+      setFillerActive(true);
+    }, 1200);
 
-      if (data.audio_base64) {
-        playBase64Audio(data.audio_base64);
-      }
-    }
-  };
-
-  const playBase64Audio = (base64String) => {
     try {
-      const audioUrl = `data:audio/wav;base64,${base64String}`;
-      if (audioRef.current) {
-        audioRef.current.src = audioUrl;
-        audioRef.current.play().catch((e) => console.log("Audio autoplay blocked by browser:", e));
-      }
-    } catch (e) {
-      console.error("Audio playback error:", e);
+      const response = await runAgentTurn({
+        transcript: text,
+        clientId: activeClient.id,
+        languageCode: activeClient.language_code,
+      });
+
+      clearTimeout(fillerTimer);
+      setFillerActive(false);
+
+      const assistantMsg = {
+        role: 'assistant',
+        text: response.response_text || 'No response generated.',
+        turn_latency_ms: response.turn_latency_ms,
+        guardrail_flag: response.guardrail_flag,
+        risk_score: response.risk_score,
+        intent: response.intent,
+        slots: response.slots,
+      };
+
+      setMessages(prev => [...prev, assistantMsg]);
+      setLastExecutionState(response);
+
+      // Play synthesized audio response (using browser SpeechSynthesis for instant zero-latency test playback)
+      speakBrowserTTS(response.response_text, activeClient.language_code);
+
+    } catch (err) {
+      clearTimeout(fillerTimer);
+      setFillerActive(false);
+      setMessages(prev => [...prev, { role: 'assistant', text: `Error: ${err.message}`, isError: true }]);
+    } finally {
+      setLoading(false);
     }
-  };
+  }
 
-  // User Interruption (Barge-In)
-  const handleInterrupt = () => {
-    if (audioRef.current) {
-      audioRef.current.pause();
+  function speakBrowserTTS(text, lang = 'en') {
+    if (!window.speechSynthesis || !text) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = lang === 'hi' ? 'hi-IN' : lang === 'ta' ? 'ta-IN' : 'en-US';
+    utterance.onstart = () => setAudioPlaying(true);
+    utterance.onend = () => setAudioPlaying(false);
+    utterance.onerror = () => setAudioPlaying(false);
+    window.speechSynthesis.speak(utterance);
+  }
+
+  // Handle Barge-In Interruption
+  function handleBargeIn() {
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+      setAudioPlaying(false);
     }
-    setIsPlayingAudio(false);
-
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: "interruption" }));
-    }
-  };
-
-  // Send turn over WebSocket or REST fallback
-  const handleSend = async (e) => {
-    e.preventDefault();
-    if (!inputText.trim() || !activeClient) return;
-
-    const userText = inputText.trim();
-    setInputText("");
-    setIsProcessing(true);
-    setCurrentFiller("Thinking & checking tools…");
-
-    // Add user message to UI immediately
-    setMessages((prev) => [
+    setMessages(prev => [
       ...prev,
-      {
-        role: "user",
-        text: userText,
-        timestamp: new Date().toLocaleTimeString(),
-      },
+      { role: 'system', text: '✋ Barge-in Interruption Detected: TTS playback cancelled instantly by VoxGuard.' }
     ]);
+  }
 
-    // Send via WebSocket if connected, else use REST API
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: "speech",
-          transcript: userText,
-        })
-      );
-    } else {
-      try {
-        const res = await api.runAgentTurn({
-          transcript: userText,
-          clientId: activeClient.id,
-          languageCode: activeClient.language_code,
-        });
+  // Handle Real Microphone Recording
+  async function startRecording() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
 
-        setCurrentFiller(null);
-        setIsProcessing(false);
+      mediaRecorder.ondataavailable = event => {
+        if (event.data.size > 0) audioChunksRef.current.push(event.data);
+      };
 
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "assistant",
-            text: res.response_text,
-            intent: res.intent,
-            slots: res.slots,
-            latency: res.turn_latency_ms,
-            guardrail: res.guardrail_flag,
-            timestamp: new Date().toLocaleTimeString(),
-          },
-        ]);
-      } catch (err) {
-        setIsProcessing(false);
-        setCurrentFiller(null);
-        console.error("Agent run error:", err);
-      }
+      mediaRecorder.onstop = async () => {
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
+        try {
+          setLoading(true);
+          const sttResult = await transcribeAudio(audioBlob, activeClient?.language_code || 'en');
+          if (sttResult.transcript) {
+            handleSend(sttResult.transcript);
+          }
+        } catch (err) {
+          alert('STT failed: ' + err.message);
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      mediaRecorder.start();
+      setIsRecording(true);
+    } catch (err) {
+      alert('Microphone access denied: ' + err.message);
     }
-  };
+  }
 
-  if (!activeClient) {
-    return (
-      <div className="glass-card" style={{ padding: "3rem", textAlign: "center" }}>
-        <p style={{ color: "var(--text-secondary)" }}>
-          Please select or register a Client Tenant in the Onboarding tab to start testing.
-        </p>
-      </div>
-    );
+  function stopRecording() {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+      // Stop all audio tracks
+      mediaRecorderRef.current.stream?.getTracks().forEach(track => track.stop());
+    }
   }
 
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: "1rem", maxWidth: "900px", margin: "0 auto" }}>
-      {/* Header bar */}
-      <div className="glass-card" style={{ padding: "1rem 1.5rem", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <div>
-          <span style={{ fontSize: "0.8rem", color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-            Active Client Playground
-          </span>
-          <h3 style={{ fontSize: "1.2rem", fontWeight: 700, color: "var(--accent-cyan)" }}>
-            {activeClient.name} ({activeClient.language_code})
-          </h3>
-        </div>
-
-        <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.85rem" }}>
-            <Radio size={16} color={wsConnected ? "var(--accent-emerald)" : "var(--accent-amber)"} />
-            <span style={{ color: wsConnected ? "var(--accent-emerald)" : "var(--accent-amber)" }}>
-              {wsConnected ? "WebSocket Connected" : "REST Mode"}
-            </span>
+    <div style={{ display: 'grid', gridTemplateColumns: '1fr 360px', gap: '1.5rem', height: 'calc(100vh - 120px)' }}>
+      {/* Left: Chat & Voice Interaction Area */}
+      <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        {/* Header Bar */}
+        <div style={{ padding: '1rem 1.5rem', borderBottom: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+            <div className={`status-dot ${isRecording ? 'recording' : 'online'}`} />
+            <div>
+              <h2 className="font-display" style={{ fontSize: '1.05rem', fontWeight: '700' }}>
+                {activeClient ? activeClient.name : 'Select a Client'}
+              </h2>
+              <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                {activeClient ? `Language: ${activeClient.language_code.toUpperCase()} • Live LangGraph State Active` : 'No tenant selected'}
+              </span>
+            </div>
           </div>
 
-          {isPlayingAudio && (
-            <button
-              onClick={handleInterrupt}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "0.4rem",
-                padding: "0.4rem 0.8rem",
-                borderRadius: 8,
-                background: "rgba(244, 63, 94, 0.2)",
-                border: "1px solid var(--accent-rose)",
-                color: "var(--accent-rose)",
-                cursor: "pointer",
-                fontWeight: 600,
-                fontSize: "0.8rem",
-              }}
-            >
-              <PhoneOff size={14} /> Barge-In (Interrupt)
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            {audioPlaying && (
+              <button onClick={handleBargeIn} className="btn-danger" style={{ padding: '0.4rem 0.8rem', fontSize: '0.75rem' }}>
+                <Hand size={14} /> Interrupt (Barge-in)
+              </button>
+            )}
+            <button onClick={() => setMessages([])} className="btn-secondary" style={{ padding: '0.4rem 0.65rem' }} title="Clear Chat">
+              <RotateCcw size={14} />
             </button>
-          )}
-        </div>
-      </div>
-
-      {/* Message Chat Container */}
-      <div
-        className="glass-card"
-        style={{
-          height: "420px",
-          padding: "1.5rem",
-          overflowY: "auto",
-          display: "flex",
-          flexDirection: "column",
-          gap: "1rem",
-        }}
-      >
-        {messages.length === 0 && (
-          <div style={{ margin: "auto", textAlign: "center", color: "var(--text-muted)" }}>
-            <Volume2 size={36} style={{ opacity: 0.5, marginBottom: "0.5rem" }} />
-            <p>Start typing or speak to test this client's dynamic agent persona.</p>
           </div>
-        )}
+        </div>
 
-        {messages.map((msg, idx) => (
-          <div
-            key={idx}
-            style={{
-              alignSelf: msg.role === "user" ? "flex-end" : "flex-start",
-              maxWidth: "75%",
-            }}
-          >
-            <div
-              style={{
-                padding: "0.8rem 1rem",
-                borderRadius: msg.role === "user" ? "14px 14px 2px 14px" : "14px 14px 14px 2px",
-                background:
-                  msg.role === "user"
-                    ? "linear-gradient(135deg, #0284c7, #2563eb)"
-                    : "rgba(30, 41, 59, 0.8)",
-                border: msg.role === "user" ? "none" : "1px solid var(--border-color)",
-                color: "#fff",
-                fontSize: "0.95rem",
-              }}
-            >
-              {msg.text}
+        {/* Chat Stream History */}
+        <div style={{ flex: 1, padding: '1.5rem', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+          {messages.map((msg, idx) => {
+            const isUser = msg.role === 'user';
+            const isSystem = msg.role === 'system';
 
-              {msg.intent && (
-                <div style={{ marginTop: "0.5rem", display: "flex", flexWrap: "wrap", gap: "0.4rem" }}>
-                  <span
-                    style={{
-                      background: "rgba(56, 189, 248, 0.2)",
-                      color: "var(--accent-cyan)",
-                      padding: "0.15rem 0.4rem",
-                      borderRadius: 4,
-                      fontSize: "0.75rem",
-                      fontWeight: 600,
-                    }}
-                  >
-                    Intent: {msg.intent}
-                  </span>
+            if (isSystem) {
+              return (
+                <div key={idx} style={{ textAlign: 'center', fontSize: '0.75rem', color: 'var(--accent-amber)', background: 'rgba(245, 158, 11, 0.1)', padding: '0.4rem 0.8rem', borderRadius: 'var(--radius-sm)', border: '1px solid rgba(245, 158, 11, 0.2)' }}>
+                  {msg.text}
+                </div>
+              );
+            }
 
-                  {msg.latency && (
-                    <span
-                      style={{
-                        background: "rgba(168, 85, 247, 0.2)",
-                        color: "var(--accent-purple)",
-                        padding: "0.15rem 0.4rem",
-                        borderRadius: 4,
-                        fontSize: "0.75rem",
-                      }}
-                    >
-                      <Zap size={10} style={{ display: "inline" }} /> {msg.latency}ms
+            return (
+              <div 
+                key={idx}
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: isUser ? 'flex-end' : 'flex-start',
+                  gap: '0.35rem',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                  <span>{isUser ? 'Caller' : activeClient?.name || 'Assistant'}</span>
+                  {msg.turn_latency_ms && (
+                    <span className="badge badge-indigo" style={{ fontSize: '0.65rem', padding: '0.1rem 0.4rem' }}>
+                      <Clock size={10} /> {msg.turn_latency_ms}ms
                     </span>
                   )}
-
-                  {msg.guardrail && (
-                    <span
-                      style={{
-                        background: "rgba(244, 63, 94, 0.2)",
-                        color: "var(--accent-rose)",
-                        padding: "0.15rem 0.4rem",
-                        borderRadius: 4,
-                        fontSize: "0.75rem",
-                      }}
-                    >
-                      <ShieldAlert size={10} style={{ display: "inline" }} /> Guardrail Flagged
+                  {msg.guardrail_flag && (
+                    <span className="badge badge-rose" style={{ fontSize: '0.65rem', padding: '0.1rem 0.4rem' }}>
+                      <AlertTriangle size={10} /> Guardrail Blocked
                     </span>
                   )}
                 </div>
-              )}
+
+                <div 
+                  style={{
+                    maxWidth: '80%',
+                    padding: '0.85rem 1.15rem',
+                    borderRadius: isUser ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
+                    background: isUser 
+                      ? 'linear-gradient(135deg, #6366f1 0%, #4f46e5 100%)' 
+                      : 'rgba(19, 25, 38, 0.75)',
+                    color: 'white',
+                    border: isUser ? '1px solid rgba(255, 255, 255, 0.15)' : '1px solid var(--border-subtle)',
+                    boxShadow: 'var(--shadow-sm)',
+                    fontSize: '0.9rem',
+                    lineHeight: '1.5',
+                  }}
+                >
+                  {msg.text}
+                </div>
+              </div>
+            );
+          })}
+
+          {/* VoxGuard Real-Time Filler Phrase Notification */}
+          {fillerActive && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', alignSelf: 'flex-start', background: 'rgba(245, 158, 11, 0.15)', border: '1px solid var(--accent-amber)', borderRadius: 'var(--radius-md)', padding: '0.6rem 0.9rem', color: '#fbbf24', fontSize: '0.82rem' }}>
+              <div className="waveform-container" style={{ height: '18px' }}>
+                <div className="waveform-bar" style={{ background: 'var(--accent-amber)', height: '12px' }} />
+                <div className="waveform-bar" style={{ background: 'var(--accent-amber)', height: '16px' }} />
+                <div className="waveform-bar" style={{ background: 'var(--accent-amber)', height: '10px' }} />
+              </div>
+              <span>VoxGuard Filler: <em>"Give me just a moment while I check that for you…"</em></span>
             </div>
+          )}
 
-            <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", marginTop: 2, display: "block", textAlign: msg.role === "user" ? "right" : "left" }}>
-              {msg.timestamp}
-            </span>
-          </div>
-        ))}
+          <div ref={chatBottomRef} />
+        </div>
 
-        {currentFiller && (
-          <div style={{ alignSelf: "flex-start", display: "flex", alignItems: "center", gap: "0.5rem" }}>
-            <div className="audio-bar"></div>
-            <div className="audio-bar"></div>
-            <div className="audio-bar"></div>
-            <span style={{ color: "var(--accent-cyan)", fontSize: "0.85rem", fontStyle: "italic" }}>
-              {currentFiller}
-            </span>
-          </div>
-        )}
+        {/* Input Bar */}
+        <div style={{ padding: '1rem 1.5rem', background: 'rgba(13, 17, 26, 0.85)', borderTop: '1px solid var(--border-subtle)' }}>
+          <form 
+            onSubmit={e => { e.preventDefault(); handleSend(); }}
+            style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}
+          >
+            {/* Mic Toggle Button */}
+            <button
+              type="button"
+              onClick={isRecording ? stopRecording : startRecording}
+              className={isRecording ? 'btn-danger' : 'btn-secondary'}
+              style={{ padding: '0.75rem', borderRadius: '50%', width: '44px', height: '44px' }}
+              title={isRecording ? 'Stop Recording' : 'Start Microphone'}
+            >
+              {isRecording ? <MicOff size={20} /> : <Mic size={20} />}
+            </button>
 
-        <div ref={messagesEndRef} />
+            {/* Real-Time Waveform visualizer during recording */}
+            {isRecording ? (
+              <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '0.75rem', background: 'rgba(244, 63, 94, 0.1)', border: '1px solid rgba(244, 63, 94, 0.3)', borderRadius: 'var(--radius-md)', padding: '0.5rem 1rem' }}>
+                <span style={{ fontSize: '0.85rem', color: '#fb7185', fontWeight: '600' }}>Listening to voice stream...</span>
+                <div className="waveform-container">
+                  <div className="waveform-bar" />
+                  <div className="waveform-bar" />
+                  <div className="waveform-bar" />
+                  <div className="waveform-bar" />
+                  <div className="waveform-bar" />
+                  <div className="waveform-bar" />
+                  <div className="waveform-bar" />
+                </div>
+              </div>
+            ) : (
+              <input
+                type="text"
+                className="glass-input"
+                placeholder={activeClient ? `Speak or type a query for ${activeClient.name}...` : 'Select a client first...'}
+                value={transcriptInput}
+                onChange={e => setTranscriptInput(e.target.value)}
+                disabled={!activeClient || loading}
+              />
+            )}
+
+            <button
+              type="submit"
+              disabled={!activeClient || loading || (!transcriptInput.trim() && !isRecording)}
+              className="btn-primary"
+              style={{ padding: '0.75rem 1.25rem' }}
+            >
+              <Send size={16} />
+            </button>
+          </form>
+        </div>
       </div>
 
-      {/* Input bar */}
-      <form onSubmit={handleSend} style={{ display: "flex", gap: "0.75rem" }}>
-        <input
-          type="text"
-          placeholder="Speak or type a message (e.g. I want to book an appointment tomorrow)..."
-          value={inputText}
-          onChange={(e) => setInputText(e.target.value)}
-          disabled={isProcessing}
-          style={{
-            flex: 1,
-            padding: "0.8rem 1.2rem",
-            borderRadius: 12,
-            background: "var(--bg-secondary)",
-            border: "1px solid var(--border-color)",
-            color: "#fff",
-            fontSize: "0.95rem",
-          }}
-        />
+      {/* Right Column: Real-Time LangGraph State Inspector */}
+      <div className="glass-panel" style={{ padding: '1.25rem', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', borderBottom: '1px solid var(--border-subtle)', paddingBottom: '0.75rem' }}>
+          <Activity size={18} color="#6366f1" />
+          <h3 className="font-display" style={{ fontSize: '1rem', fontWeight: '700' }}>LangGraph State Inspector</h3>
+        </div>
 
-        <button
-          type="submit"
-          disabled={isProcessing || !inputText.trim()}
-          style={{
-            padding: "0 1.5rem",
-            borderRadius: 12,
-            background: "linear-gradient(135deg, var(--accent-cyan), var(--accent-purple))",
-            color: "#fff",
-            border: "none",
-            fontWeight: 600,
-            cursor: "pointer",
-            display: "flex",
-            alignItems: "center",
-            gap: "0.5rem",
-          }}
-        >
-          <Send size={18} /> Send
-        </button>
-      </form>
+        {lastExecutionState ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+            {/* Metric Chips */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.65rem' }}>
+              <div className="glass-card" style={{ padding: '0.75rem' }}>
+                <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>Turn Latency</span>
+                <div style={{ fontSize: '1.2rem', fontWeight: '800', color: '#818cf8', fontFamily: 'var(--font-mono)' }}>
+                  {lastExecutionState.turn_latency_ms}ms
+                </div>
+              </div>
+
+              <div className="glass-card" style={{ padding: '0.75rem' }}>
+                <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>Safety Score</span>
+                <div style={{ fontSize: '1.2rem', fontWeight: '800', color: lastExecutionState.guardrail_flag ? '#fb7185' : '#34d399', fontFamily: 'var(--font-mono)' }}>
+                  {lastExecutionState.guardrail_flag ? 'BLOCKED' : '100% SAFE'}
+                </div>
+              </div>
+            </div>
+
+            {/* Classified Intent */}
+            <div>
+              <span style={{ fontSize: '0.75rem', fontWeight: '600', color: 'var(--text-secondary)', display: 'block', marginBottom: '0.3rem' }}>
+                Classified Intent:
+              </span>
+              <span className="badge badge-indigo" style={{ fontSize: '0.8rem', padding: '0.35rem 0.75rem' }}>
+                {lastExecutionState.intent || 'unknown'}
+              </span>
+            </div>
+
+            {/* Extracted Slots */}
+            <div>
+              <span style={{ fontSize: '0.75rem', fontWeight: '600', color: 'var(--text-secondary)', display: 'block', marginBottom: '0.3rem' }}>
+                Extracted Parameters / Slots:
+              </span>
+              <pre className="font-mono" style={{ background: '#07090e', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', padding: '0.65rem', fontSize: '0.75rem', color: '#22d3ee', overflowX: 'auto' }}>
+                {JSON.stringify(lastExecutionState.slots || {}, null, 2)}
+              </pre>
+            </div>
+
+            {/* Client Context Info */}
+            <div style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '0.75rem', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+              <div>Tenant ID: <span className="font-mono" style={{ color: 'var(--text-secondary)' }}>{lastExecutionState.client_id}</span></div>
+              <div>State Machine: <span style={{ color: '#34d399', fontWeight: '600' }}>6-Node Graph Online</span></div>
+            </div>
+          </div>
+        ) : (
+          <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', marginTop: '2rem' }}>
+            Send a query or record voice to inspect real-time state machine transitions and telemetry.
+          </div>
+        )}
+      </div>
     </div>
   );
 }
