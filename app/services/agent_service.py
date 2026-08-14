@@ -1,33 +1,13 @@
 """
-VoxGuard LangGraph Agent Service — Phase 4
+VoxGuard Dynamic Agent Service — Phase 5 Vector Memory Integration
 
-Implements the 6-node conversation state machine:
+The LangGraph state machine is 100% dynamic and multi-tenant.
+Every node reads instructions and isolated vector memory from ClientConfig.
 
-  [START]
-    │
-    ▼
-  LANGUAGE_DETECT  ──► detects language / normalises language_code
-    │
-    ▼
-  GUARDRAIL        ──► safety check; sets guardrail_flag & risk_score
-    │ (safe)
-    ▼
-  INTENT_DETECT    ──► classifies user intent from transcript
-    │
-    ▼
-  SLOT_FILL        ──► extracts named entities / slots from transcript
-    │
-    ▼
-  TOOL_EXECUTE     ──► calls the domain tool (appointment lookup, FAQ, etc.)
-    │
-    ▼
-  RESPOND          ──► builds final assistant response
-    │
-    ▼
-  [END]
-
-All transitions and node outputs are automatically traced in LangSmith
-when LANGCHAIN_TRACING_V2=true is set in the environment.
+Graph topology:
+    START → language_detect → guardrail
+                                 ├─(blocked)─► respond → END
+                                 └─(safe)────► memory_retrieve → intent_detect → slot_fill → tool_execute → respond → END
 """
 from __future__ import annotations
 
@@ -35,20 +15,22 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
+import httpx
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 from langgraph.graph import END, START, StateGraph
 
 from app.schemas.agent_state import AgentState
+from app.schemas.client import ClientConfig, ToolSchema
 from app.services.recovery_service import recovery_engine
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Configure LangSmith tracing environment variables
+# LangSmith Tracing Setup
 # ---------------------------------------------------------------------------
 if settings.LANGSMITH_API_KEY:
     os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
@@ -58,276 +40,265 @@ if settings.LANGSMITH_API_KEY:
 
 
 # ---------------------------------------------------------------------------
-# LLM Client (Groq — free, fast, sufficient for intent/slot tasks)
+# LLM Factory
 # ---------------------------------------------------------------------------
-def _build_llm() -> ChatGroq:
+def _build_llm(temperature: float = 0.0) -> ChatGroq:
     return ChatGroq(
         model="deepseek-r1-distill-llama-70b",
         api_key=settings.GROQ_API_KEY or "sk-placeholder",
-        temperature=0.0,
+        temperature=temperature,
         max_tokens=512,
     )
 
 
+def _get_client_config(state: AgentState) -> ClientConfig:
+    """Extract ClientConfig from state."""
+    cfg = state.get("client_config")
+    if not cfg:
+        raise RuntimeError("client_config not found in AgentState.")
+    return cfg  # type: ignore[return-value]
+
+
 # ---------------------------------------------------------------------------
-# Node: Language Detection
+# Node 1: Language Detection
 # ---------------------------------------------------------------------------
 def node_language_detect(state: AgentState) -> AgentState:
-    """
-    Detects and normalises the conversation language.
-    For now uses a simple heuristic based on script detection;
-    production would use langdetect or Sarvam's language API.
-    """
-    lang = state.get("language_code") or "en"
-    # Normalise to base ISO code (e.g. 'hi-IN' → 'hi')
+    cfg = _get_client_config(state)
+    lang = state.get("language_code") or cfg.language_code
     lang = lang.split("-")[0].lower()
-    logger.info("[Node: language_detect] lang=%s", lang)
+    logger.info("[language_detect] client=%s lang=%s", cfg.client_id, lang)
     return {**state, "language_code": lang}
 
 
 # ---------------------------------------------------------------------------
-# Node: Guardrail Safety
+# Node 2: Guardrail Safety Check
 # ---------------------------------------------------------------------------
 def node_guardrail(state: AgentState) -> AgentState:
-    """
-    Runs the VoxGuard safety heuristic on the incoming transcript.
-    If the content is flagged, sets guardrail_flag=True and short-circuits.
-    """
     transcript = state.get("transcript", "") or ""
     result = recovery_engine.evaluate_safety(transcript)
-    logger.info("[Node: guardrail] safe=%s risk=%.2f", result["safe"], result["risk_score"])
+    logger.info("[guardrail] safe=%s risk=%.2f", result["safe"], result["risk_score"])
     return {
         **state,
         "guardrail_flag": not result["safe"],
         "risk_score": float(result["risk_score"]),
-        "error": None if result["safe"] else f"Guardrail blocked: {result['reason']}",
+        "error": None if result["safe"] else f"Blocked: {result['reason']}",
     }
 
 
 # ---------------------------------------------------------------------------
-# Node: Intent Detection
+# Node 3: Semantic Vector Memory Retrieval (Phase 5)
+# ---------------------------------------------------------------------------
+def node_memory_retrieve(state: AgentState) -> AgentState:
+    """
+    Passes through or enriches memory_context for this client's namespace.
+    """
+    cfg = _get_client_config(state)
+    memories = state.get("memory_context") or []
+    logger.info("[memory_retrieve] client=%s existing_memories=%d", cfg.client_id, len(memories))
+    return {**state, "memory_context": memories}
+
+
+# ---------------------------------------------------------------------------
+# Node 4: Dynamic Intent Detection
 # ---------------------------------------------------------------------------
 def node_intent_detect(state: AgentState) -> AgentState:
-    """
-    Uses Groq DeepSeek-R1 to classify user intent from the transcript.
-    Returns a single intent label from a controlled vocabulary.
-    """
+    cfg = _get_client_config(state)
     transcript = state.get("transcript", "") or ""
     lang = state.get("language_code", "en")
 
-    _intents = [
-        "book_appointment", "cancel_appointment", "check_status",
-        "find_doctor", "check_availability", "ask_faq",
-        "emergency", "unknown",
-    ]
+    if not cfg.intent_labels:
+        logger.info("[intent_detect] no intent labels defined — using 'unknown'")
+        return {**state, "intent": "unknown"}
+
+    examples_text = ""
+    for intent, phrases in cfg.intent_examples.items():
+        examples_text += f"\n- Intent '{intent}': {', '.join(f'\"{p}\"' for p in phrases[:3])}"
 
     system_prompt = (
-        f"You are an intent classifier for a medical voice assistant. "
-        f"The user speaks in language code '{lang}'. "
-        f"Return ONLY one of these intent labels (no explanation): "
-        f"{', '.join(_intents)}"
+        f"{cfg.system_prompt}\n\n"
+        f"TASK: Classify user intent. Return ONLY one label from this list:\n"
+        f"{', '.join(cfg.intent_labels)}\n\n"
+        f"Examples:{examples_text}\n\n"
+        f"Language context: {lang}. Return ONLY the intent label. No explanation."
     )
 
+    intent = "unknown"
     try:
         llm = _build_llm()
-        response = llm.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=transcript),
-        ])
-        intent = str(response.content).strip().lower().split()[0]
-        if intent not in _intents:
-            intent = "unknown"
+        resp = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=transcript)])
+        candidate = str(resp.content).strip().lower().split()[0].strip(".,")
+        if candidate in cfg.intent_labels:
+            intent = candidate
     except Exception as exc:
-        logger.warning("[Node: intent_detect] LLM failed: %s", exc)
-        intent = "unknown"
+        logger.warning("[intent_detect] LLM failed: %s", exc)
 
-    logger.info("[Node: intent_detect] intent=%s", intent)
+    logger.info("[intent_detect] client=%s intent=%s", cfg.client_id, intent)
     return {**state, "intent": intent}
 
 
 # ---------------------------------------------------------------------------
-# Node: Slot Filling
+# Node 5: Dynamic Slot Filling
 # ---------------------------------------------------------------------------
 def node_slot_fill(state: AgentState) -> AgentState:
-    """
-    Extracts structured slot values from the transcript using Groq.
-    Returns a JSON dict of slot-value pairs relevant to the detected intent.
-    """
+    cfg = _get_client_config(state)
     transcript = state.get("transcript", "") or ""
     intent = state.get("intent", "unknown")
 
+    if not cfg.tools:
+        return {**state, "slots": {}}
+
+    tool_params_text = ""
+    for tool in cfg.tools:
+        if tool.parameters:
+            tool_params_text += f"\nTool '{tool.name}': {json.dumps(tool.parameters)}"
+
+    if not tool_params_text:
+        return {**state, "slots": {}}
+
     system_prompt = (
-        f"You are a slot extractor for a voice assistant. "
-        f"The user's intent is '{intent}'. "
-        f"Extract relevant named entities as a flat JSON object. "
-        f"Keys should be slot names (e.g. doctor_type, date, time, patient_name). "
-        f"Return ONLY valid JSON, nothing else. "
-        f"If no slots found return {{}}."
+        f"{cfg.system_prompt}\n\n"
+        f"TASK: Extract parameter values from the user's message.\n"
+        f"User intent: '{intent}'\n"
+        f"Available tool parameters:{tool_params_text}\n\n"
+        f"Return ONLY valid JSON. Keys should be parameter names. "
+        f"Use null for missing values. Return {{}} if nothing found."
     )
 
     slots: Dict[str, Any] = {}
     try:
         llm = _build_llm()
-        response = llm.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=transcript),
-        ])
-        raw = str(response.content).strip()
-        # Extract JSON from response (handle markdown code blocks)
+        resp = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=transcript)])
+        raw = str(resp.content).strip()
         if "```" in raw:
             raw = raw.split("```")[1].replace("json", "").strip()
         slots = json.loads(raw)
     except Exception as exc:
-        logger.warning("[Node: slot_fill] slot extraction failed: %s", exc)
-        slots = {}
+        logger.warning("[slot_fill] failed: %s", exc)
 
-    logger.info("[Node: slot_fill] slots=%s", slots)
+    logger.info("[slot_fill] client=%s slots=%s", cfg.client_id, slots)
     return {**state, "slots": slots}
 
 
 # ---------------------------------------------------------------------------
-# Node: Tool Execution (Mock — real tools added per domain)
+# Node 6: Dynamic Tool Execution
 # ---------------------------------------------------------------------------
-def node_tool_execute(state: AgentState) -> AgentState:
-    """
-    Executes the domain tool corresponding to the detected intent.
+async def _call_real_api(api_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(api_url, json=payload)
+        resp.raise_for_status()
+        return dict(resp.json())
 
-    Production: each intent maps to a real async tool (EHR lookup, calendar API, etc.)
-    Here we use deterministic mocks so the graph is fully testable without external APIs.
-    """
+
+def node_tool_execute(state: AgentState) -> AgentState:
+    cfg = _get_client_config(state)
     intent = state.get("intent", "unknown")
     slots = state.get("slots") or {}
 
-    _mock_responses: Dict[str, Dict[str, Any]] = {
-        "book_appointment": {
-            "status": "confirmed",
-            "message": "Appointment booked successfully.",
-            "slot_time": "2026-08-14T10:30:00",
-            "doctor": slots.get("doctor_type", "General Physician"),
-        },
-        "cancel_appointment": {
-            "status": "cancelled",
-            "message": "Your appointment has been cancelled.",
-        },
-        "check_availability": {
-            "status": "available",
-            "slots": ["09:00", "11:30", "14:00"],
-        },
-        "find_doctor": {
-            "status": "found",
-            "doctors": [f"Dr. Sharma ({slots.get('doctor_type', 'General')})"],
-        },
-        "check_status": {
-            "status": "active",
-            "last_appointment": "2026-08-01T09:00:00",
-        },
-        "ask_faq": {
-            "status": "answered",
-            "answer": "Our clinic is open Monday–Saturday, 9 AM to 6 PM.",
-        },
-        "emergency": {
-            "status": "emergency",
-            "message": "Connecting you to emergency services now.",
-        },
-        "unknown": {
-            "status": "clarify",
-            "message": "I didn't quite catch that. Could you please repeat?",
-        },
-    }
+    if not cfg.tools:
+        return {**state, "tool_result": {"status": "no_tools", "message": "No tools configured."}}
 
-    result = _mock_responses.get(intent, _mock_responses["unknown"])
-    logger.info("[Node: tool_execute] intent=%s result_status=%s", intent, result.get("status"))
+    matched_tool: ToolSchema = cfg.tools[0]
+    for tool in cfg.tools:
+        if tool.name == intent:
+            matched_tool = tool
+            break
+
+    payload = {**slots, "intent": intent, "client_id": cfg.client_id}
+
+    if matched_tool.api_url.startswith("mock://"):
+        result: Dict[str, Any] = {
+            "status": "success",
+            "tool": matched_tool.name,
+            "message": f"Action '{matched_tool.name}' completed successfully.",
+            "data": slots,
+        }
+    else:
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            result = loop.run_until_complete(_call_real_api(matched_tool.api_url, payload))
+        except Exception as exc:
+            logger.error("[tool_execute] API call failed for '%s': %s", matched_tool.name, exc)
+            result = {"status": "error", "message": str(exc)}
+
+    logger.info("[tool_execute] client=%s tool=%s status=%s", cfg.client_id, matched_tool.name, result.get("status"))
     return {**state, "tool_result": result}
 
 
 # ---------------------------------------------------------------------------
-# Node: Respond — build final assistant reply
+# Node 7: Dynamic Response Generation (with Memory Context)
 # ---------------------------------------------------------------------------
 def node_respond(state: AgentState) -> AgentState:
-    """
-    Composes the final assistant text response to be sent to TTS.
-    Uses Groq to generate a natural, conversational reply from the tool result.
-    """
+    cfg = _get_client_config(state)
     tool_result = state.get("tool_result") or {}
     intent = state.get("intent", "unknown")
-    lang = state.get("language_code", "en")
+    lang = state.get("language_code", cfg.language_code)
     transcript = state.get("transcript", "")
+    memory_context = state.get("memory_context") or []
 
-    # Blocked by guardrail
     if state.get("guardrail_flag"):
-        response_text = "I'm sorry, I can't help with that request."
-        logger.info("[Node: respond] guardrail short-circuit")
-        return {**state, "tool_result": {**tool_result, "response_text": response_text}}
+        return {**state, "tool_result": {**tool_result, "response_text": "I'm sorry, I can't help with that."}}
+
+    memory_text = ""
+    if memory_context:
+        snippets = [m.get("content", "") for m in memory_context if m.get("content")]
+        if snippets:
+            memory_text = "\n\nRetrieved Client Knowledge / Past History:\n" + "\n".join(f"- {s}" for s in snippets)
 
     system_prompt = (
-        f"You are a warm, professional medical voice assistant. "
-        f"Respond in language code '{lang}' in 1-2 short sentences. "
-        f"Be conversational and natural — this will be read aloud over a phone call. "
-        f"Use the tool result to give the user accurate information."
+        f"{cfg.system_prompt}\n\n"
+        f"TASK: Generate a brief, natural spoken response (1-2 sentences max).\n"
+        f"This response will be READ ALOUD via text-to-speech — keep it conversational.\n"
+        f"Language: {lang}.{memory_text}"
     )
 
     user_content = (
-        f"User said: '{transcript}'\n"
-        f"Intent: {intent}\n"
-        f"Tool result: {json.dumps(tool_result)}"
+        f"User said: \"{transcript}\"\n"
+        f"Detected intent: {intent}\n"
+        f"Tool result: {json.dumps(tool_result, ensure_ascii=False)}"
     )
 
-    response_text = tool_result.get("message", "Done!")
+    response_text = str(tool_result.get("message", "Done!"))
     try:
-        llm = _build_llm()
-        response = llm.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_content),
-        ])
-        response_text = str(response.content).strip()
+        llm = _build_llm(temperature=0.3)
+        resp = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_content)])
+        response_text = str(resp.content).strip()
     except Exception as exc:
-        logger.warning("[Node: respond] LLM response generation failed: %s", exc)
+        logger.warning("[respond] LLM failed: %s", exc)
 
-    logger.info("[Node: respond] response_text='%s'", response_text[:80])
+    logger.info("[respond] client=%s text='%s...'", cfg.client_id, response_text[:60])
     return {**state, "tool_result": {**tool_result, "response_text": response_text}}
 
 
 # ---------------------------------------------------------------------------
-# Conditional Edge: Route based on guardrail verdict
+# Conditional Edge
 # ---------------------------------------------------------------------------
 def _route_after_guardrail(state: AgentState) -> str:
-    """Skip to respond node directly if content was flagged by guardrail."""
-    if state.get("guardrail_flag"):
-        logger.info("VoxGuard: content blocked → routing to respond (skip tools)")
-        return "respond"
-    return "intent_detect"
+    return "respond" if state.get("guardrail_flag") else "memory_retrieve"
 
 
 # ---------------------------------------------------------------------------
-# Build & Compile the LangGraph State Machine
+# Graph Builder
 # ---------------------------------------------------------------------------
 def build_voxguard_graph() -> Any:
-    """
-    Constructs and compiles the VoxGuard conversation state machine.
-
-    Graph topology:
-        START → language_detect → guardrail
-                                      ├─(blocked)─► respond → END
-                                      └─(safe)────► intent_detect → slot_fill → tool_execute → respond → END
-    """
     graph = StateGraph(AgentState)
 
-    # Register nodes
     graph.add_node("language_detect", node_language_detect)
     graph.add_node("guardrail", node_guardrail)
+    graph.add_node("memory_retrieve", node_memory_retrieve)
     graph.add_node("intent_detect", node_intent_detect)
     graph.add_node("slot_fill", node_slot_fill)
     graph.add_node("tool_execute", node_tool_execute)
     graph.add_node("respond", node_respond)
 
-    # Define edges
     graph.add_edge(START, "language_detect")
     graph.add_edge("language_detect", "guardrail")
     graph.add_conditional_edges(
         "guardrail",
         _route_after_guardrail,
-        {"intent_detect": "intent_detect", "respond": "respond"},
+        {"memory_retrieve": "memory_retrieve", "respond": "respond"},
     )
+    graph.add_edge("memory_retrieve", "intent_detect")
     graph.add_edge("intent_detect", "slot_fill")
     graph.add_edge("slot_fill", "tool_execute")
     graph.add_edge("tool_execute", "respond")
@@ -336,27 +307,24 @@ def build_voxguard_graph() -> Any:
     return graph.compile()
 
 
-# ---------------------------------------------------------------------------
-# Module-level compiled graph singleton
-# ---------------------------------------------------------------------------
+# Module-level compiled graph
 voxguard_graph = build_voxguard_graph()
 
 
 async def run_agent(
     transcript: str,
-    language_code: str = "en",
+    client_config: ClientConfig,
+    language_code: str | None = None,
     session_id: str = "",
+    memory_context: Optional[List[Dict[str, Any]]] = None,
 ) -> AgentState:
-    """
-    Convenience wrapper: run the full VoxGuard graph for one turn.
-
-    Returns the final AgentState after all nodes have executed.
-    """
     t0 = time.monotonic()
     initial_state: AgentState = {
         "transcript": transcript,
-        "language_code": language_code,
+        "language_code": language_code or client_config.language_code,
         "session_id": session_id,
+        "client_config": client_config,  # type: ignore[typeddict-item]
+        "memory_context": memory_context or [],
         "messages": [{"role": "user", "content": transcript}],
     }
     final_state: AgentState = await voxguard_graph.ainvoke(initial_state)

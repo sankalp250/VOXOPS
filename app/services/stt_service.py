@@ -103,7 +103,7 @@ class MultiProviderSTTService:
         lang_code = language if "-" in language else f"{language}-IN"
         headers = {"api-subscription-key": settings.SARVAM_API_KEY}
         files = {"file": (filename, file_bytes, "audio/wav")}
-        data = {"model": "saarika:v1", "language_code": lang_code}
+        data = {"model": "saarika:v2.5", "language_code": lang_code}
 
         try:
             logger.info("STT → Sarvam Saarika (%s)", lang_code)

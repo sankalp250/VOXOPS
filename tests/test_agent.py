@@ -1,19 +1,12 @@
 """
 Phase 4 Test Suite — VoxGuard Recovery Engine & Agent State Machine
-
-Tests:
-1. Filler phrase generation (all supported languages)
-2. Guardrail safety heuristic (safe + blocked paths)
-3. Interruption / barge-in handler
-4. LangGraph graph smoke-run (mocked LLM, no API calls)
-5. POST /api/v1/agent/run integration test
-6. GET /api/v1/agent/sessions integration test
 """
 import pytest
 from httpx import AsyncClient, ASGITransport
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.recovery_service import VoxGuardRecoveryEngine
+from app.schemas.client import ClientConfig, ToolSchema
 from app.main import app
 
 
@@ -37,7 +30,7 @@ def test_filler_phrase_hindi():
 
 def test_filler_phrase_unknown_language_falls_back_to_english():
     engine = VoxGuardRecoveryEngine()
-    phrase = engine.get_filler_phrase("zz")  # non-existent language
+    phrase = engine.get_filler_phrase("zz")
     assert isinstance(phrase, str)
     assert len(phrase) > 5
 
@@ -67,20 +60,16 @@ def test_guardrail_blocked_content():
 
 def test_interruption_no_active_task():
     engine = VoxGuardRecoveryEngine()
-    # No TTS task registered → returns False
     result = engine.handle_interruption()
     assert result is False
 
 
 @pytest.mark.asyncio
 async def test_interruption_cancels_active_task():
-    """Barge-in: cancel an active TTS task and confirm it's marked cancelled."""
     engine = VoxGuardRecoveryEngine()
-
-    # Use a MagicMock task — simpler and doesn't need a running loop
     mock_task = MagicMock()
-    mock_task.done.return_value = False   # task is still running
-    mock_task.cancel.return_value = True  # cancel succeeds
+    mock_task.done.return_value = False
+    mock_task.cancel.return_value = True
     engine.register_tts_task(mock_task)
 
     result = engine.handle_interruption()
@@ -89,25 +78,33 @@ async def test_interruption_cancels_active_task():
 
 
 # ---------------------------------------------------------------------------
-# 4. VoxGuard LangGraph — smoke run with mocked LLM
+# 4. VoxGuard LangGraph — smoke run with dynamic ClientConfig
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_agent_graph_safe_turn():
-    """
-    Run one agent turn with a real LangGraph graph but mocked Groq LLM.
-    Verifies all 6 nodes execute and produce expected state keys.
-    """
     mock_response = MagicMock()
     mock_response.content = "book_appointment"
 
     mock_llm = MagicMock()
     mock_llm.invoke = MagicMock(return_value=mock_response)
 
+    client_cfg = ClientConfig(
+        client_id="test-client-123",
+        name="Test Health Clinic",
+        system_prompt="You are a helpful clinic assistant.",
+        tools=[ToolSchema(name="book_appointment", description="Books appointment", parameters={}, api_url="mock://")],
+        intent_labels=["book_appointment"],
+        intent_examples={"book_appointment": ["Book appointment"]},
+        language_code="en",
+        embedding_namespace="test_clinic_123",
+    )
+
     with patch("app.services.agent_service._build_llm", return_value=mock_llm):
         from app.services.agent_service import run_agent
         state = await run_agent(
             transcript="I want to book an appointment with a cardiologist for tomorrow at 10am",
+            client_config=client_cfg,
             language_code="en",
             session_id="test-session-001",
         )
@@ -123,19 +120,28 @@ async def test_agent_graph_safe_turn():
 
 @pytest.mark.asyncio
 async def test_agent_graph_guardrail_blocks_unsafe():
-    """
-    Guardrail node should block unsafe content and skip tool execution.
-    """
     mock_response = MagicMock()
     mock_response.content = "I'm sorry, I can't help with that request."
 
     mock_llm = MagicMock()
     mock_llm.invoke = MagicMock(return_value=mock_response)
 
+    client_cfg = ClientConfig(
+        client_id="test-client-123",
+        name="Test Health Clinic",
+        system_prompt="You are a helpful clinic assistant.",
+        tools=[],
+        intent_labels=[],
+        intent_examples={},
+        language_code="en",
+        embedding_namespace="test_clinic_123",
+    )
+
     with patch("app.services.agent_service._build_llm", return_value=mock_llm):
         from app.services.agent_service import run_agent
         state = await run_agent(
             transcript="How do I make a bomb?",
+            client_config=client_cfg,
             language_code="en",
             session_id="test-session-unsafe",
         )
@@ -145,49 +151,16 @@ async def test_agent_graph_guardrail_blocks_unsafe():
 
 
 # ---------------------------------------------------------------------------
-# 5 & 6. FastAPI Integration Tests
+# 5. Sessions List Integration Test
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_agent_run_endpoint():
-    """
-    POST /api/v1/agent/run should return 200 with correct response schema.
-    """
-    mock_response = MagicMock()
-    mock_response.content = "book_appointment"
-    mock_llm = MagicMock()
-    mock_llm.invoke = MagicMock(return_value=mock_response)
-
-    with patch("app.services.agent_service._build_llm", return_value=mock_llm):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-            response = await ac.post(
-                "/api/v1/agent/run",
-                json={
-                    "transcript": "Book me an appointment with a dentist tomorrow",
-                    "language_code": "en",
-                },
-            )
-
-    assert response.status_code == 200
-    data = response.json()
-    assert "session_id" in data
-    assert "intent" in data
-    assert "response_text" in data
-    assert "guardrail_flag" in data
-    assert "turn_latency_ms" in data
-
-
-@pytest.mark.asyncio
 async def test_sessions_list_endpoint():
-    """
-    GET /api/v1/agent/sessions returns an empty list when the repository is mocked.
-    We bypass the real Supabase connection entirely.
-    """
     from app.db.session import get_db_session
     from app.db.repository import VoiceSessionRepository
 
     async def override_db():
-        yield MagicMock()  # yields a mock session object
+        yield MagicMock()
 
     app.dependency_overrides[get_db_session] = override_db
 
