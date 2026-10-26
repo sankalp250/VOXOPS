@@ -6,25 +6,49 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Format Database URL to use asyncpg or psycopg
+import socket
+from urllib.parse import urlparse
+
+# Format Database URL with resilient DNS check and SQLite fallback
 def get_db_url() -> str:
     url = settings.DATABASE_URL
-    if not url:
-        # Fallback in-memory SQLite for testing if DB_URL not provided
-        return "sqlite+aiosqlite:///:memory:"
+    if not url or "sqlite" in url:
+        return "sqlite+aiosqlite:///./voxops.db"
+
     # Convert postgresql:// to postgresql+asyncpg:// if not specified
     if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+    # Validate remote hostname DNS resolution to avoid crashing on dead/paused Supabase projects
+    try:
+        clean_url = url.replace("+asyncpg", "")
+        parsed = urlparse(clean_url)
+        if parsed.hostname and not parsed.hostname.startswith("localhost") and parsed.hostname != "127.0.0.1":
+            socket.getaddrinfo(parsed.hostname, parsed.port or 5432)
+    except socket.gaierror as dns_err:
+        logger.warning(
+            f"Configured database host '{parsed.hostname}' is unreachable ({dns_err}). "
+            f"Falling back to local persistent SQLite 'sqlite+aiosqlite:///./voxops.db' for seamless operation."
+        )
+        return "sqlite+aiosqlite:///./voxops.db"
+    except Exception as e:
+        logger.debug(f"Database URL check exception: {e}")
+
     return url
 
 
 # Create Async SQLAlchemy Engine
-engine = create_async_engine(
-    get_db_url(),
-    echo=settings.DEBUG,
-    future=True,
-    pool_pre_ping=True,
-)
+_db_url = get_db_url()
+_engine_kwargs = {
+    "echo": settings.DEBUG,
+    "future": True,
+}
+if "sqlite" in _db_url:
+    _engine_kwargs["connect_args"] = {"check_same_thread": False}
+else:
+    _engine_kwargs["pool_pre_ping"] = True
+
+engine = create_async_engine(_db_url, **_engine_kwargs)
 
 # Async Session Factory
 AsyncSessionLocal = async_sessionmaker(

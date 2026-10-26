@@ -117,6 +117,7 @@ class MemoryService:
 
         # Calculate embedding vector
         vector = await self.embedding_service.get_embedding(content)
+        meta["vector"] = vector  # Store full vector for instant cosine similarity
         meta["vector_preview"] = vector[:10]  # Store preview in JSON metadata
 
         record = EmbeddingMemory(
@@ -140,6 +141,7 @@ class MemoryService:
     ) -> List[Dict[str, Any]]:
         """
         Semantic search across past conversation memory, strictly filtered by client_id.
+        Uses cached vectors in metadata to achieve O(1) embedding overhead.
         """
         if not query or not query.strip():
             return []
@@ -147,7 +149,7 @@ class MemoryService:
         query_vec = await self.embedding_service.get_embedding(query)
 
         # Query records from database
-        result = await db.execute(select(EmbeddingMemory))
+        result = await db.execute(select(EmbeddingMemory).order_by(EmbeddingMemory.created_at.desc()).limit(100))
         all_records = result.scalars().all()
 
         scored_results = []
@@ -157,7 +159,13 @@ class MemoryService:
             if str(rec_meta.get("client_id")) != str(client_id):
                 continue
 
-            doc_vec = await self.embedding_service.get_embedding(rec.content)
+            # Performance optimization: use stored vector if available, avoid remote API roundtrip
+            if "vector" in rec_meta and isinstance(rec_meta["vector"], list):
+                doc_vec = rec_meta["vector"]
+            else:
+                doc_vec = await self.embedding_service.get_embedding(rec.content)
+                rec_meta["vector"] = doc_vec  # backfill in-memory
+
             sim = self.embedding_service.cosine_similarity(query_vec, doc_vec)
 
             if sim >= min_similarity:

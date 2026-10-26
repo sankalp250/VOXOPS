@@ -1,13 +1,44 @@
 /**
- * VOXOPS API Client Service Layer
+ * VOXOPS API Client Service Layer — Production-grade Fail-safe Client
  */
 
 const API_BASE = '/api/v1';
 
+/**
+ * Universal safe response parser that prevents "Unexpected end of JSON input".
+ * Handles empty bodies (204 No Content), HTML gateway error pages, and plain text responses.
+ */
+async function handleResponse(res) {
+  const text = await res.text();
+  let data = null;
+
+  if (text && text.trim().length > 0) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      // Non-JSON response (e.g., HTML from proxy or plaintext from 500 handler)
+      data = { message: text.length > 200 ? `${text.slice(0, 200)}...` : text };
+    }
+  }
+
+  if (!res.ok) {
+    let message = data?.detail || data?.message || data?.error;
+    if (!message) {
+      if (res.status === 504 || res.status === 502) {
+        message = 'Backend server unreachable on port 8000. Please start the backend.';
+      } else {
+        message = `Request failed (${res.status}: ${res.statusText || 'Error'})`;
+      }
+    }
+    throw new Error(message);
+  }
+
+  return data;
+}
+
 export async function fetchClients() {
   const res = await fetch(`${API_BASE}/clients`);
-  if (!res.ok) throw new Error(`Failed to fetch clients: ${res.statusText}`);
-  return res.json();
+  return handleResponse(res);
 }
 
 export async function createClient(payload) {
@@ -16,17 +47,12 @@ export async function createClient(payload) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.detail || 'Failed to create client');
-  }
-  return res.json();
+  return handleResponse(res);
 }
 
 export async function getClientById(clientId) {
   const res = await fetch(`${API_BASE}/clients/${clientId}`);
-  if (!res.ok) throw new Error('Client not found');
-  return res.json();
+  return handleResponse(res);
 }
 
 export async function runAgentTurn({ transcript, clientId, apiKey, languageCode = 'en' }) {
@@ -47,16 +73,19 @@ export async function runAgentTurn({ transcript, clientId, apiKey, languageCode 
     headers,
     body: JSON.stringify(body),
   });
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.detail || 'Agent execution failed');
-  }
-  return res.json();
+  return handleResponse(res);
 }
 
 export async function transcribeAudio(audioBlob, languageCode = 'en') {
   const formData = new FormData();
-  formData.append('file', audioBlob, 'recording.wav');
+  let filename = 'recording.webm';
+  if (audioBlob.type) {
+    if (audioBlob.type.includes('wav')) filename = 'recording.wav';
+    else if (audioBlob.type.includes('ogg')) filename = 'recording.ogg';
+    else if (audioBlob.type.includes('mp4') || audioBlob.type.includes('m4a')) filename = 'recording.m4a';
+    else if (audioBlob.type.includes('webm')) filename = 'recording.webm';
+  }
+  formData.append('file', audioBlob, filename);
   formData.append('language_code', languageCode);
   formData.append('preferred_provider', 'auto');
 
@@ -64,11 +93,7 @@ export async function transcribeAudio(audioBlob, languageCode = 'en') {
     method: 'POST',
     body: formData,
   });
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.detail || 'Audio transcription failed');
-  }
-  return res.json();
+  return handleResponse(res);
 }
 
 export async function ingestMemory({ content, clientId, apiKey, metadata = {} }) {
@@ -84,8 +109,7 @@ export async function ingestMemory({ content, clientId, apiKey, metadata = {} })
       metadata_info: metadata,
     }),
   });
-  if (!res.ok) throw new Error('Memory ingestion failed');
-  return res.json();
+  return handleResponse(res);
 }
 
 export async function searchMemory({ query, clientId, apiKey, topK = 3 }) {
@@ -101,17 +125,19 @@ export async function searchMemory({ query, clientId, apiKey, topK = 3 }) {
       top_k: topK,
     }),
   });
-  if (!res.ok) throw new Error('Memory search failed');
-  return res.json();
+  return handleResponse(res);
 }
 
 export async function fetchRecentSessions() {
   const res = await fetch(`${API_BASE}/agent/sessions`);
-  if (!res.ok) throw new Error('Failed to fetch sessions');
-  return res.json();
+  return handleResponse(res);
 }
 
 export async function checkSystemHealth() {
-  const res = await fetch(`${API_BASE}/health`);
-  return res.json();
+  try {
+    const res = await fetch(`${API_BASE}/health`);
+    return await handleResponse(res);
+  } catch (err) {
+    return { status: 'offline', error: err.message };
+  }
 }

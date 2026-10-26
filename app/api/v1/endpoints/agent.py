@@ -114,7 +114,7 @@ async def agent_run(
         agent_name="VoxGuard-LangGraph",
         stt_provider="upstream",
         tts_provider="pending",
-        llm_model="deepseek-r1-distill-llama-70b",
+        llm_model="llama-3.3-70b-versatile",
         thought_process={
             "intent": final_state.get("intent"),
             "slots": final_state.get("slots"),

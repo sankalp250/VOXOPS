@@ -1,182 +1,136 @@
 import React, { useState, useEffect } from 'react';
-import { 
-  Radio, Mic, Building2, Database, BarChart3, 
-  ShieldCheck, Cpu, ChevronDown, Sparkles, Layers, Activity 
-} from 'lucide-react';
+import { Mic, Building2, Database, BarChart3, ArrowLeft, LogOut } from 'lucide-react';
+import LandingPage from './components/LandingPage';
+import AuthModal from './components/AuthModal';
 import ClientConfigurator from './components/ClientConfigurator';
 import VoicePlayground from './components/VoicePlayground';
 import VectorMemoryInspector from './components/VectorMemoryInspector';
 import TelemetryDashboard from './components/TelemetryDashboard';
-import { fetchClients, checkSystemHealth } from './services/api';
+import { fetchClients } from './services/api';
+
+const TABS = [
+  { id: 'playground',    label: 'Voice Playground', icon: <Mic size={14} /> },
+  { id: 'configurator',  label: 'Dynamic Builder',  icon: <Building2 size={14} /> },
+  { id: 'memory',        label: 'Vector Memory',    icon: <Database size={14} /> },
+  { id: 'telemetry',     label: 'Telemetry',        icon: <BarChart3 size={14} /> },
+];
 
 export default function App() {
+  const [view, setView] = useState('landing');
   const [activeTab, setActiveTab] = useState('playground');
   const [clients, setClients] = useState([]);
   const [activeClient, setActiveClient] = useState(null);
-  const [systemHealth, setSystemHealth] = useState({ status: 'operational' });
+  const [isAuthOpen, setIsAuthOpen] = useState(false);
+  const [currentUser, setCurrentUser] = useState(null);
 
   useEffect(() => {
-    initApp();
+    const savedUser = localStorage.getItem('voxops_user');
+    if (savedUser) setCurrentUser(JSON.parse(savedUser));
+    fetchClients()
+      .then(list => { setClients(list); if (list.length > 0) setActiveClient(list[0]); })
+      .catch(console.error);
   }, []);
 
-  async function initApp() {
-    try {
-      const health = await checkSystemHealth();
-      setSystemHealth(health);
-      const clientList = await fetchClients();
-      setClients(clientList);
-      if (clientList.length > 0) {
-        setActiveClient(clientList[0]);
-      }
-    } catch (err) {
-      console.error('App init error:', err);
-    }
+  function handleLogout() {
+    localStorage.removeItem('voxops_user');
+    setCurrentUser(null);
+    setView('landing');
+  }
+
+  function handleClientSaved(c) {
+    setActiveClient(c);
+    setClients(prev => prev.some(x => x.id === c.id) ? prev : [...prev, c]);
   }
 
   return (
-    <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
-      {/* Top Mission-Control Navigation Header */}
-      <header 
-        style={{
-          position: 'sticky',
-          top: 0,
-          zIndex: 50,
-          background: 'rgba(7, 9, 14, 0.85)',
-          backdropFilter: 'blur(24px)',
-          WebkitBackdropFilter: 'blur(24px)',
-          borderBottom: '1px solid var(--border-subtle)',
-          padding: '0.75rem 2rem',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-        }}
-      >
-        {/* Brand & System Status */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '1.5rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
-            <div 
-              style={{
-                width: '32px',
-                height: '32px',
-                borderRadius: '8px',
-                background: 'linear-gradient(135deg, #6366f1 0%, #06b6d4 100%)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                boxShadow: '0 0 15px rgba(99, 102, 241, 0.5)',
-              }}
-            >
-              <Radio size={18} color="white" />
-            </div>
-            <div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                <span className="font-display" style={{ fontWeight: '900', fontSize: '1.15rem', letterSpacing: '-0.03em' }}>
-                  VOX<span style={{ color: '#818cf8' }}>OPS</span>
-                </span>
-                <span className="badge badge-indigo" style={{ fontSize: '0.6rem', padding: '0.15rem 0.45rem' }}>
-                  VoxGuard v2.0
-                </span>
+    <div>
+      <AuthModal isOpen={isAuthOpen} onClose={() => setIsAuthOpen(false)} onLoginSuccess={user => { setCurrentUser(user); setView('console'); }} />
+
+      {view === 'landing' && (
+        <LandingPage
+          onLaunchConsole={() => setView('console')}
+          onOpenAuth={() => setIsAuthOpen(true)}
+          currentUser={currentUser}
+          activeClient={activeClient}
+        />
+      )}
+
+      {view === 'console' && (
+        <div className="console-shell">
+          {/* Header */}
+          <header className="console-header">
+            {/* Brand + Back */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+              <button onClick={() => setView('landing')} className="btn btn-outline btn-sm">
+                <ArrowLeft size={13} /> Home
+              </button>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <svg width="18" height="18" viewBox="0 0 20 20" fill="none">
+                  <circle cx="10" cy="10" r="9" stroke="var(--ink)" strokeWidth="1.5"/>
+                  <path d="M6 10 Q10 6 14 10 Q10 14 6 10Z" fill="var(--ink)"/>
+                </svg>
+                <span style={{ fontWeight: '800', fontSize: '1rem', letterSpacing: '-0.02em' }}>VoxOps</span>
+                <span className="tag tag-lavender" style={{ fontSize: '0.65rem' }}>Studio</span>
               </div>
             </div>
-          </div>
 
-          {/* System Health Indicators */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', borderLeft: '1px solid var(--border-subtle)', paddingLeft: '1.25rem' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.72rem', color: 'var(--text-secondary)' }}>
-              <div className="status-dot online" />
-              <span>Supabase PgVector</span>
+            {/* Tabs */}
+            <nav className="tab-group hide-mobile">
+              {TABS.map(t => (
+                <button
+                  key={t.id}
+                  className={`tab-item ${activeTab === t.id ? 'active' : ''}`}
+                  onClick={() => setActiveTab(t.id)}
+                >
+                  {t.icon} {t.label}
+                </button>
+              ))}
+            </nav>
+
+            {/* Right: tenant switcher + user */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+              {clients.length > 0 && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <span style={{ fontSize: '0.72rem', color: 'var(--ink-light)', fontWeight: '500' }}>Tenant</span>
+                  <select
+                    className="input"
+                    style={{ width: 'auto', padding: '0.35rem 0.7rem', fontSize: '0.78rem', fontWeight: '600' }}
+                    value={activeClient?.id || ''}
+                    onChange={e => {
+                      const found = clients.find(c => c.id === e.target.value);
+                      if (found) setActiveClient(found);
+                    }}
+                  >
+                    {clients.map(c => (
+                      <option key={c.id} value={c.id}>{c.name} ({c.language_code})</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              {currentUser ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                  <img src={currentUser.avatar} alt="" style={{ width: '26px', height: '26px', borderRadius: '50%', border: '1.5px solid var(--border)' }} />
+                  <span style={{ fontSize: '0.8rem', fontWeight: '600' }} className="hide-mobile">{currentUser.name.split(' ')[0]}</span>
+                  <button onClick={handleLogout} className="btn btn-outline btn-sm" title="Sign out">
+                    <LogOut size={13} />
+                  </button>
+                </div>
+              ) : (
+                <button onClick={() => setIsAuthOpen(true)} className="btn btn-dark btn-sm">Sign In</button>
+              )}
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.72rem', color: 'var(--text-secondary)' }}>
-              <Cpu size={12} color="#06b6d4" />
-              <span>Groq DeepSeek-R1</span>
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.72rem', color: 'var(--text-secondary)' }}>
-              <ShieldCheck size={12} color="#10b981" />
-              <span>Guardrails Active</span>
-            </div>
-          </div>
+          </header>
+
+          {/* Main content */}
+          <main className="console-main">
+            {activeTab === 'playground'   && <VoicePlayground activeClient={activeClient} />}
+            {activeTab === 'configurator' && <ClientConfigurator activeClient={activeClient} onSelectClient={handleClientSaved} />}
+            {activeTab === 'memory'       && <VectorMemoryInspector activeClient={activeClient} />}
+            {activeTab === 'telemetry'    && <TelemetryDashboard activeClient={activeClient} />}
+          </main>
         </div>
-
-        {/* Center: Navigation Tabs */}
-        <nav style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', background: 'rgba(19, 25, 38, 0.6)', padding: '0.3rem', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-subtle)' }}>
-          <button
-            onClick={() => setActiveTab('playground')}
-            className={activeTab === 'playground' ? 'btn-primary' : 'btn-secondary'}
-            style={{ padding: '0.45rem 1rem', fontSize: '0.8rem' }}
-          >
-            <Mic size={14} /> Voice Playground
-          </button>
-          <button
-            onClick={() => setActiveTab('configurator')}
-            className={activeTab === 'configurator' ? 'btn-primary' : 'btn-secondary'}
-            style={{ padding: '0.45rem 1rem', fontSize: '0.8rem' }}
-          >
-            <Building2 size={14} /> Dynamic Builder
-          </button>
-          <button
-            onClick={() => setActiveTab('memory')}
-            className={activeTab === 'memory' ? 'btn-primary' : 'btn-secondary'}
-            style={{ padding: '0.45rem 1rem', fontSize: '0.8rem' }}
-          >
-            <Database size={14} /> Vector Memory (RAG)
-          </button>
-          <button
-            onClick={() => setActiveTab('telemetry')}
-            className={activeTab === 'telemetry' ? 'btn-primary' : 'btn-secondary'}
-            style={{ padding: '0.45rem 1rem', fontSize: '0.8rem' }}
-          >
-            <BarChart3 size={14} /> Telemetry & Recovery
-          </button>
-        </nav>
-
-        {/* Right: Active Client Selector */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
-            <span style={{ fontSize: '0.65rem', color: 'var(--text-muted)', textTransform: 'uppercase', fontWeight: '700' }}>Active Tenant</span>
-            <span style={{ fontSize: '0.82rem', fontWeight: '700', color: '#818cf8' }}>
-              {activeClient ? activeClient.name : 'None Selected'}
-            </span>
-          </div>
-
-          <select
-            className="glass-input"
-            style={{ width: 'auto', padding: '0.4rem 0.75rem', fontSize: '0.75rem', fontWeight: '600' }}
-            value={activeClient?.id || ''}
-            onChange={(e) => {
-              const selected = clients.find(c => c.id === e.target.value);
-              if (selected) setActiveClient(selected);
-            }}
-          >
-            {clients.map(c => (
-              <option key={c.id} value={c.id}>
-                {c.name} ({c.language_code})
-              </option>
-            ))}
-          </select>
-        </div>
-      </header>
-
-      {/* Main Dynamic View Area */}
-      <main style={{ flex: 1, padding: '1.5rem 2rem' }}>
-        {activeTab === 'playground' && (
-          <VoicePlayground activeClient={activeClient} />
-        )}
-        {activeTab === 'configurator' && (
-          <ClientConfigurator 
-            activeClient={activeClient} 
-            onSelectClient={(c) => {
-              setActiveClient(c);
-              setClients(prev => prev.some(x => x.id === c.id) ? prev : [...prev, c]);
-            }} 
-          />
-        )}
-        {activeTab === 'memory' && (
-          <VectorMemoryInspector activeClient={activeClient} />
-        )}
-        {activeTab === 'telemetry' && (
-          <TelemetryDashboard activeClient={activeClient} />
-        )}
-      </main>
+      )}
     </div>
   );
 }

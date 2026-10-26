@@ -1,385 +1,348 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { 
-  Mic, MicOff, Send, Volume2, ShieldAlert, ShieldCheck, Clock, 
-  Activity, Sparkles, AlertTriangle, Play, Pause, RotateCcw, Hand
-} from 'lucide-react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Mic, MicOff, Send, Trash2, Bot, User, Loader2, Volume2, VolumeX, RefreshCw } from 'lucide-react';
 import { runAgentTurn, transcribeAudio } from '../services/api';
 
+/* ─── helpers ─── */
+function formatTime(d = new Date()) {
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
 export default function VoicePlayground({ activeClient }) {
-  const [transcriptInput, setTranscriptInput] = useState('');
-  const [messages, setMessages] = useState([
-    {
+  const [messages, setMessages] = useState([]);          // { id, role, text, time, latency, intent }
+  const [input, setInput]       = useState('');
+  const [recording, setRecording] = useState(false);
+  const [thinking, setThinking]  = useState(false);
+  const [muted, setMuted]        = useState(false);
+  const [error, setError]        = useState(null);
+
+  const bottomRef    = useRef(null);
+  const recorderRef  = useRef(null);
+  const chunksRef    = useRef([]);
+
+  /* seed greeting when client changes */
+  useEffect(() => {
+    if (!activeClient) return;
+    setMessages([{
+      id: Date.now(),
       role: 'assistant',
-      text: activeClient ? `Hello! I am ${activeClient.name}'s voice assistant. How can I help you today?` : 'Please select or create a client tenant to begin voice testing.',
-      turn_latency_ms: 120,
-      guardrail_flag: false,
-      intent: 'welcome',
-      slots: {},
-    }
-  ]);
-  const [loading, setLoading] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
-  const [fillerActive, setFillerActive] = useState(false);
-  const [audioPlaying, setAudioPlaying] = useState(false);
-  const [lastExecutionState, setLastExecutionState] = useState(null);
+      text: `Hi! I'm ${activeClient.name}. How can I help you today?`,
+      time: formatTime(),
+    }]);
+    setError(null);
+  }, [activeClient?.id]);
 
-  // Audio Recording Refs
-  const mediaRecorderRef = useRef(null);
-  const audioChunksRef = useRef([]);
-  const chatBottomRef = useRef(null);
-
+  /* auto-scroll */
   useEffect(() => {
-    chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, fillerActive]);
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, thinking]);
 
-  useEffect(() => {
-    if (activeClient) {
-      setMessages([
-        {
-          role: 'assistant',
-          text: `Connected to ${activeClient.name} (${activeClient.language_code}). How can I help?`,
-          turn_latency_ms: 80,
-          guardrail_flag: false,
-          intent: 'welcome',
-          slots: {},
-        }
-      ]);
-    }
-  }, [activeClient]);
-
-  // Handle Text Submission
-  async function handleSend(textToSend) {
-    const text = (textToSend || transcriptInput).trim();
-    if (!text || !activeClient) return;
-
-    // 1. Append User Message
-    const userMsg = { role: 'user', text };
+  /* send a text turn */
+  async function send(text) {
+    if (!text.trim() || !activeClient || thinking) return;
+    const userMsg = { id: Date.now(), role: 'user', text, time: formatTime() };
     setMessages(prev => [...prev, userMsg]);
-    setTranscriptInput('');
-    setLoading(true);
-
-    // Simulate VoxGuard Filler Phrase if response takes > 1.2s
-    const fillerTimer = setTimeout(() => {
-      setFillerActive(true);
-    }, 1200);
-
+    setInput('');
+    setThinking(true);
+    setError(null);
     try {
-      const response = await runAgentTurn({
+      const res = await runAgentTurn({
         transcript: text,
         clientId: activeClient.id,
         languageCode: activeClient.language_code,
       });
-
-      clearTimeout(fillerTimer);
-      setFillerActive(false);
-
-      const assistantMsg = {
+      const asstMsg = {
+        id: Date.now() + 1,
         role: 'assistant',
-        text: response.response_text || 'No response generated.',
-        turn_latency_ms: response.turn_latency_ms,
-        guardrail_flag: response.guardrail_flag,
-        risk_score: response.risk_score,
-        intent: response.intent,
-        slots: response.slots,
+        text: res.response_text,
+        time: formatTime(),
+        latency: res.turn_latency_ms,
+        intent: res.intent,
       };
+      setMessages(prev => [...prev, asstMsg]);
 
-      setMessages(prev => [...prev, assistantMsg]);
-      setLastExecutionState(response);
-
-      // Play synthesized audio response (using browser SpeechSynthesis for instant zero-latency test playback)
-      speakBrowserTTS(response.response_text, activeClient.language_code);
-
+      /* speak via browser TTS if not muted */
+      if (!muted && res.response_text && window.speechSynthesis) {
+        window.speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance(res.response_text);
+        window.speechSynthesis.speak(u);
+      }
     } catch (err) {
-      clearTimeout(fillerTimer);
-      setFillerActive(false);
-      setMessages(prev => [...prev, { role: 'assistant', text: `Error: ${err.message}`, isError: true }]);
+      setError(err.message);
     } finally {
-      setLoading(false);
+      setThinking(false);
     }
   }
 
-  function speakBrowserTTS(text, lang = 'en') {
-    if (!window.speechSynthesis || !text) return;
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = lang === 'hi' ? 'hi-IN' : lang === 'ta' ? 'ta-IN' : 'en-US';
-    utterance.onstart = () => setAudioPlaying(true);
-    utterance.onend = () => setAudioPlaying(false);
-    utterance.onerror = () => setAudioPlaying(false);
-    window.speechSynthesis.speak(utterance);
-  }
-
-  // Handle Barge-In Interruption
-  function handleBargeIn() {
-    if (window.speechSynthesis) {
-      window.speechSynthesis.cancel();
-      setAudioPlaying(false);
-    }
-    setMessages(prev => [
-      ...prev,
-      { role: 'system', text: '✋ Barge-in Interruption Detected: TTS playback cancelled instantly by VoxGuard.' }
-    ]);
-  }
-
-  // Handle Real Microphone Recording
-  async function startRecording() {
+  /* mic recording */
+  async function startRec() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
-
-      mediaRecorder.ondataavailable = event => {
-        if (event.data.size > 0) audioChunksRef.current.push(event.data);
-      };
-
-      mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
+      const recorder = new MediaRecorder(stream);
+      chunksRef.current = [];
+      recorder.ondataavailable = e => chunksRef.current.push(e.data);
+      recorder.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop());
+        const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
+        setThinking(true);
         try {
-          setLoading(true);
-          const sttResult = await transcribeAudio(audioBlob, activeClient?.language_code || 'en');
-          if (sttResult.transcript) {
-            handleSend(sttResult.transcript);
+          const { transcript } = await transcribeAudio(blob, activeClient?.language_code || 'en');
+          if (transcript?.trim() && !transcript.startsWith('[Transcription unavailable')) {
+            await send(transcript);
+          } else {
+            setError('Could not clearly transcribe speech. Please try speaking again.');
           }
-        } catch (err) {
-          alert('STT failed: ' + err.message);
+        } catch (e) {
+          setError(e.message);
         } finally {
-          setLoading(false);
+          setThinking(false);
         }
       };
-
-      mediaRecorder.start();
-      setIsRecording(true);
-    } catch (err) {
-      alert('Microphone access denied: ' + err.message);
+      recorder.start();
+      recorderRef.current = recorder;
+      setRecording(true);
+    } catch {
+      setError('Microphone access denied. Please enable mic permissions.');
     }
   }
 
-  function stopRecording() {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
-      // Stop all audio tracks
-      mediaRecorderRef.current.stream?.getTracks().forEach(track => track.stop());
-    }
+  function stopRec() {
+    recorderRef.current?.stop();
+    setRecording(false);
+  }
+
+  function clearConversation() {
+    if (!activeClient) return;
+    setMessages([{
+      id: Date.now(),
+      role: 'assistant',
+      text: `Hi! I'm ${activeClient.name}. How can I help you today?`,
+      time: formatTime(),
+    }]);
+    setError(null);
+    window.speechSynthesis?.cancel();
+  }
+
+  /* ─── empty state ─── */
+  if (!activeClient) {
+    return (
+      <div style={styles.emptyState}>
+        <Bot size={40} color="var(--ink-light)" />
+        <p style={{ color: 'var(--ink-muted)', fontWeight: '600', marginTop: '0.75rem' }}>No agent selected</p>
+        <p style={{ color: 'var(--ink-light)', fontSize: '0.85rem' }}>Create an agent in the Builder tab first.</p>
+      </div>
+    );
   }
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '1fr 360px', gap: '1.5rem', height: 'calc(100vh - 120px)' }}>
-      {/* Left: Chat & Voice Interaction Area */}
-      <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        {/* Header Bar */}
-        <div style={{ padding: '1rem 1.5rem', borderBottom: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            <div className={`status-dot ${isRecording ? 'recording' : 'online'}`} />
-            <div>
-              <h2 className="font-display" style={{ fontSize: '1.05rem', fontWeight: '700' }}>
-                {activeClient ? activeClient.name : 'Select a Client'}
-              </h2>
-              <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
-                {activeClient ? `Language: ${activeClient.language_code.toUpperCase()} • Live LangGraph State Active` : 'No tenant selected'}
-              </span>
+    <div style={styles.shell}>
+      {/* ── Header bar ─────────────────────────────────── */}
+      <div style={styles.chatHeader}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+          <div style={styles.agentAvatar}>
+            <Bot size={20} color="#fff" />
+          </div>
+          <div>
+            <div style={{ fontWeight: '700', fontSize: '0.95rem' }}>{activeClient.name}</div>
+            <div style={{ fontSize: '0.72rem', color: 'var(--ink-light)', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+              <span className="dot-live" />
+              Live · {activeClient.language_code?.toUpperCase()}
             </div>
           </div>
-
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-            {audioPlaying && (
-              <button onClick={handleBargeIn} className="btn-danger" style={{ padding: '0.4rem 0.8rem', fontSize: '0.75rem' }}>
-                <Hand size={14} /> Interrupt (Barge-in)
-              </button>
-            )}
-            <button onClick={() => setMessages([])} className="btn-secondary" style={{ padding: '0.4rem 0.65rem' }} title="Clear Chat">
-              <RotateCcw size={14} />
-            </button>
-          </div>
         </div>
-
-        {/* Chat Stream History */}
-        <div style={{ flex: 1, padding: '1.5rem', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-          {messages.map((msg, idx) => {
-            const isUser = msg.role === 'user';
-            const isSystem = msg.role === 'system';
-
-            if (isSystem) {
-              return (
-                <div key={idx} style={{ textAlign: 'center', fontSize: '0.75rem', color: 'var(--accent-amber)', background: 'rgba(245, 158, 11, 0.1)', padding: '0.4rem 0.8rem', borderRadius: 'var(--radius-sm)', border: '1px solid rgba(245, 158, 11, 0.2)' }}>
-                  {msg.text}
-                </div>
-              );
-            }
-
-            return (
-              <div 
-                key={idx}
-                style={{
-                  display: 'flex',
-                  flexDirection: 'column',
-                  alignItems: isUser ? 'flex-end' : 'flex-start',
-                  gap: '0.35rem',
-                }}
-              >
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.72rem', color: 'var(--text-muted)' }}>
-                  <span>{isUser ? 'Caller' : activeClient?.name || 'Assistant'}</span>
-                  {msg.turn_latency_ms && (
-                    <span className="badge badge-indigo" style={{ fontSize: '0.65rem', padding: '0.1rem 0.4rem' }}>
-                      <Clock size={10} /> {msg.turn_latency_ms}ms
-                    </span>
-                  )}
-                  {msg.guardrail_flag && (
-                    <span className="badge badge-rose" style={{ fontSize: '0.65rem', padding: '0.1rem 0.4rem' }}>
-                      <AlertTriangle size={10} /> Guardrail Blocked
-                    </span>
-                  )}
-                </div>
-
-                <div 
-                  style={{
-                    maxWidth: '80%',
-                    padding: '0.85rem 1.15rem',
-                    borderRadius: isUser ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
-                    background: isUser 
-                      ? 'linear-gradient(135deg, #6366f1 0%, #4f46e5 100%)' 
-                      : 'rgba(19, 25, 38, 0.75)',
-                    color: 'white',
-                    border: isUser ? '1px solid rgba(255, 255, 255, 0.15)' : '1px solid var(--border-subtle)',
-                    boxShadow: 'var(--shadow-sm)',
-                    fontSize: '0.9rem',
-                    lineHeight: '1.5',
-                  }}
-                >
-                  {msg.text}
-                </div>
-              </div>
-            );
-          })}
-
-          {/* VoxGuard Real-Time Filler Phrase Notification */}
-          {fillerActive && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', alignSelf: 'flex-start', background: 'rgba(245, 158, 11, 0.15)', border: '1px solid var(--accent-amber)', borderRadius: 'var(--radius-md)', padding: '0.6rem 0.9rem', color: '#fbbf24', fontSize: '0.82rem' }}>
-              <div className="waveform-container" style={{ height: '18px' }}>
-                <div className="waveform-bar" style={{ background: 'var(--accent-amber)', height: '12px' }} />
-                <div className="waveform-bar" style={{ background: 'var(--accent-amber)', height: '16px' }} />
-                <div className="waveform-bar" style={{ background: 'var(--accent-amber)', height: '10px' }} />
-              </div>
-              <span>VoxGuard Filler: <em>"Give me just a moment while I check that for you…"</em></span>
-            </div>
-          )}
-
-          <div ref={chatBottomRef} />
-        </div>
-
-        {/* Input Bar */}
-        <div style={{ padding: '1rem 1.5rem', background: 'rgba(13, 17, 26, 0.85)', borderTop: '1px solid var(--border-subtle)' }}>
-          <form 
-            onSubmit={e => { e.preventDefault(); handleSend(); }}
-            style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}
+        <div style={{ display: 'flex', gap: '0.5rem' }}>
+          <button
+            className="btn btn-outline btn-sm"
+            onClick={() => setMuted(m => !m)}
+            title={muted ? 'Unmute agent voice' : 'Mute agent voice'}
           >
-            {/* Mic Toggle Button */}
-            <button
-              type="button"
-              onClick={isRecording ? stopRecording : startRecording}
-              className={isRecording ? 'btn-danger' : 'btn-secondary'}
-              style={{ padding: '0.75rem', borderRadius: '50%', width: '44px', height: '44px' }}
-              title={isRecording ? 'Stop Recording' : 'Start Microphone'}
-            >
-              {isRecording ? <MicOff size={20} /> : <Mic size={20} />}
-            </button>
-
-            {/* Real-Time Waveform visualizer during recording */}
-            {isRecording ? (
-              <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '0.75rem', background: 'rgba(244, 63, 94, 0.1)', border: '1px solid rgba(244, 63, 94, 0.3)', borderRadius: 'var(--radius-md)', padding: '0.5rem 1rem' }}>
-                <span style={{ fontSize: '0.85rem', color: '#fb7185', fontWeight: '600' }}>Listening to voice stream...</span>
-                <div className="waveform-container">
-                  <div className="waveform-bar" />
-                  <div className="waveform-bar" />
-                  <div className="waveform-bar" />
-                  <div className="waveform-bar" />
-                  <div className="waveform-bar" />
-                  <div className="waveform-bar" />
-                  <div className="waveform-bar" />
-                </div>
-              </div>
-            ) : (
-              <input
-                type="text"
-                className="glass-input"
-                placeholder={activeClient ? `Speak or type a query for ${activeClient.name}...` : 'Select a client first...'}
-                value={transcriptInput}
-                onChange={e => setTranscriptInput(e.target.value)}
-                disabled={!activeClient || loading}
-              />
-            )}
-
-            <button
-              type="submit"
-              disabled={!activeClient || loading || (!transcriptInput.trim() && !isRecording)}
-              className="btn-primary"
-              style={{ padding: '0.75rem 1.25rem' }}
-            >
-              <Send size={16} />
-            </button>
-          </form>
+            {muted ? <VolumeX size={14} /> : <Volume2 size={14} />}
+            {muted ? 'Unmuted' : 'Voice On'}
+          </button>
+          <button className="btn btn-outline btn-sm" onClick={clearConversation} title="Clear conversation">
+            <Trash2 size={14} /> Clear
+          </button>
         </div>
       </div>
 
-      {/* Right Column: Real-Time LangGraph State Inspector */}
-      <div className="glass-panel" style={{ padding: '1.25rem', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', borderBottom: '1px solid var(--border-subtle)', paddingBottom: '0.75rem' }}>
-          <Activity size={18} color="#6366f1" />
-          <h3 className="font-display" style={{ fontSize: '1rem', fontWeight: '700' }}>LangGraph State Inspector</h3>
-        </div>
-
-        {lastExecutionState ? (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-            {/* Metric Chips */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.65rem' }}>
-              <div className="glass-card" style={{ padding: '0.75rem' }}>
-                <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>Turn Latency</span>
-                <div style={{ fontSize: '1.2rem', fontWeight: '800', color: '#818cf8', fontFamily: 'var(--font-mono)' }}>
-                  {lastExecutionState.turn_latency_ms}ms
-                </div>
+      {/* ── Chat Messages ───────────────────────────────── */}
+      <div style={styles.messageList}>
+        {messages.map(msg => (
+          <div key={msg.id} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start', gap: '0.3rem' }}>
+            <div style={{ display: 'flex', alignItems: 'flex-end', gap: '0.5rem', flexDirection: msg.role === 'user' ? 'row-reverse' : 'row' }}>
+              {/* Avatar */}
+              <div style={{
+                width: '28px', height: '28px', borderRadius: '50%', flexShrink: 0,
+                background: msg.role === 'user' ? 'var(--ink)' : 'var(--lavender)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+              }}>
+                {msg.role === 'user' ? <User size={14} color="#fff" /> : <Bot size={14} color="#6B4FBB" />}
               </div>
-
-              <div className="glass-card" style={{ padding: '0.75rem' }}>
-                <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>Safety Score</span>
-                <div style={{ fontSize: '1.2rem', fontWeight: '800', color: lastExecutionState.guardrail_flag ? '#fb7185' : '#34d399', fontFamily: 'var(--font-mono)' }}>
-                  {lastExecutionState.guardrail_flag ? 'BLOCKED' : '100% SAFE'}
-                </div>
+              {/* Bubble */}
+              <div style={{
+                maxWidth: '70%',
+                background: msg.role === 'user' ? 'var(--ink)' : 'var(--cream-card)',
+                color: msg.role === 'user' ? '#fff' : 'var(--ink)',
+                border: msg.role === 'user' ? 'none' : '1px solid var(--border)',
+                borderRadius: msg.role === 'user' ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
+                padding: '0.75rem 1rem',
+                fontSize: '0.92rem',
+                lineHeight: '1.55',
+                boxShadow: 'var(--shadow-card)',
+              }}>
+                {msg.text}
               </div>
             </div>
-
-            {/* Classified Intent */}
-            <div>
-              <span style={{ fontSize: '0.75rem', fontWeight: '600', color: 'var(--text-secondary)', display: 'block', marginBottom: '0.3rem' }}>
-                Classified Intent:
-              </span>
-              <span className="badge badge-indigo" style={{ fontSize: '0.8rem', padding: '0.35rem 0.75rem' }}>
-                {lastExecutionState.intent || 'unknown'}
-              </span>
-            </div>
-
-            {/* Extracted Slots */}
-            <div>
-              <span style={{ fontSize: '0.75rem', fontWeight: '600', color: 'var(--text-secondary)', display: 'block', marginBottom: '0.3rem' }}>
-                Extracted Parameters / Slots:
-              </span>
-              <pre className="font-mono" style={{ background: '#07090e', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', padding: '0.65rem', fontSize: '0.75rem', color: '#22d3ee', overflowX: 'auto' }}>
-                {JSON.stringify(lastExecutionState.slots || {}, null, 2)}
-              </pre>
-            </div>
-
-            {/* Client Context Info */}
-            <div style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '0.75rem', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-              <div>Tenant ID: <span className="font-mono" style={{ color: 'var(--text-secondary)' }}>{lastExecutionState.client_id}</span></div>
-              <div>State Machine: <span style={{ color: '#34d399', fontWeight: '600' }}>6-Node Graph Online</span></div>
+            {/* Meta */}
+            <div style={{ paddingLeft: msg.role === 'user' ? 0 : '36px', paddingRight: msg.role === 'user' ? '36px' : 0, display: 'flex', gap: '0.6rem', fontSize: '0.68rem', color: 'var(--ink-light)' }}>
+              <span>{msg.time}</span>
+              {msg.latency && <span>· {msg.latency}ms</span>}
+              {msg.intent && msg.intent !== 'unknown' && <span>· {msg.intent}</span>}
             </div>
           </div>
-        ) : (
-          <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', marginTop: '2rem' }}>
-            Send a query or record voice to inspect real-time state machine transitions and telemetry.
+        ))}
+
+        {/* Thinking indicator */}
+        {thinking && (
+          <div style={{ display: 'flex', alignItems: 'flex-end', gap: '0.5rem' }}>
+            <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: 'var(--lavender)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+              <Bot size={14} color="#6B4FBB" />
+            </div>
+            <div style={{ background: 'var(--cream-card)', border: '1px solid var(--border)', borderRadius: '18px 18px 18px 4px', padding: '0.75rem 1.1rem', display: 'flex', gap: '4px', alignItems: 'center' }}>
+              {[0, 150, 300].map(d => (
+                <div key={d} style={{ width: '6px', height: '6px', borderRadius: '50%', background: 'var(--ink-light)', animation: `pulse-dot 1.2s ease-in-out ${d}ms infinite` }} />
+              ))}
+            </div>
           </div>
         )}
+
+        {/* Error */}
+        {error && (
+          <div style={{ background: 'var(--peach-bg)', border: '1px solid var(--peach)', borderRadius: 'var(--r-md)', padding: '0.75rem 1rem', fontSize: '0.85rem', color: '#B04A37', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            ⚠ {error}
+            <button onClick={() => setError(null)} style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: '#B04A37', fontSize: '1rem' }}>×</button>
+          </div>
+        )}
+
+        <div ref={bottomRef} />
       </div>
+
+      {/* ── Input Bar ───────────────────────────────────── */}
+      <div style={styles.inputBar}>
+        {/* Mic button */}
+        <button
+          onMouseDown={startRec}
+          onMouseUp={stopRec}
+          onTouchStart={startRec}
+          onTouchEnd={stopRec}
+          disabled={thinking}
+          title="Hold to speak"
+          style={{
+            width: '44px', height: '44px', borderRadius: '50%', flexShrink: 0,
+            background: recording ? '#E53E3E' : 'var(--ink)',
+            border: 'none', cursor: 'pointer',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            transition: 'background 0.2s',
+            boxShadow: recording ? '0 0 0 6px rgba(229,62,62,0.2)' : 'none',
+          }}
+        >
+          {recording ? <MicOff size={18} color="#fff" /> : <Mic size={18} color="#fff" />}
+        </button>
+
+        {/* Text input */}
+        <form
+          onSubmit={e => { e.preventDefault(); send(input); }}
+          style={{ flex: 1, display: 'flex', gap: '0.5rem' }}
+        >
+          <input
+            className="input"
+            placeholder={recording ? '🎤 Listening...' : `Message ${activeClient.name}...`}
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            disabled={thinking || recording}
+            style={{ borderRadius: 'var(--r-pill)', paddingLeft: '1.25rem' }}
+            autoFocus
+          />
+          <button
+            type="submit"
+            disabled={!input.trim() || thinking}
+            style={{
+              width: '44px', height: '44px', borderRadius: '50%', flexShrink: 0,
+              background: input.trim() && !thinking ? 'var(--ink)' : 'var(--cream-dark)',
+              border: '1.5px solid var(--border)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              cursor: input.trim() && !thinking ? 'pointer' : 'not-allowed',
+              transition: 'all 0.2s',
+            }}
+          >
+            {thinking
+              ? <Loader2 size={16} color="var(--ink-muted)" style={{ animation: 'spin 1s linear infinite' }} />
+              : <Send size={16} color={input.trim() ? '#fff' : 'var(--ink-light)'} />
+            }
+          </button>
+        </form>
+      </div>
+
+      <style>{`
+        @keyframes spin { to { transform: rotate(360deg); } }
+      `}</style>
     </div>
   );
 }
+
+const styles = {
+  shell: {
+    display: 'flex',
+    flexDirection: 'column',
+    height: 'calc(100vh - 61px)',  /* full height minus header */
+    background: 'var(--cream-soft)',
+    borderRadius: 'var(--r-xl)',
+    border: '1px solid var(--border)',
+    overflow: 'hidden',
+    maxWidth: '800px',
+    margin: '0 auto',
+  },
+  chatHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '1rem 1.5rem',
+    background: 'var(--cream-card)',
+    borderBottom: '1px solid var(--border)',
+    flexShrink: 0,
+  },
+  agentAvatar: {
+    width: '36px',
+    height: '36px',
+    borderRadius: '50%',
+    background: 'var(--ink)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  messageList: {
+    flex: 1,
+    overflowY: 'auto',
+    padding: '1.5rem',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '1.25rem',
+  },
+  inputBar: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.75rem',
+    padding: '1rem 1.5rem',
+    background: 'var(--cream-card)',
+    borderTop: '1px solid var(--border)',
+    flexShrink: 0,
+  },
+  emptyState: {
+    height: 'calc(100vh - 61px)',
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: '0.5rem',
+    color: 'var(--ink-light)',
+  },
+};

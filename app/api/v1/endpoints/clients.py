@@ -263,7 +263,7 @@ async def agent_run(
     await VoiceSessionRepository.log_agent_execution(
         db=db, session_id=voice_session.id, agent_name="VoxGuard-Dynamic",
         stt_provider="upstream", tts_provider="pending",
-        llm_model="deepseek-r1-distill-llama-70b",
+        llm_model="llama-3.3-70b-versatile",
         thought_process={"intent": final_state.get("intent"), "slots": final_state.get("slots")},
         turn_latency_ms=latency,
         guardrail_verdict="blocked" if guardrail else "approved",

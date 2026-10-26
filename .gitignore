@@ -9,12 +9,24 @@ htmlcov/
 # Environments
 .env
 .env.local
+.venv/
 venv/
 ENV/
 env/
+
+# Databases & local stores
+*.db
+*.sqlite3
+voxops.db
+
+# Frontend
+node_modules/
+dist/
+build/
 
 # IDE & OS
 .vscode/
 .idea/
 .DS_Store
 *.log
+

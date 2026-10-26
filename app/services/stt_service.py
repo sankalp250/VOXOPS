@@ -73,10 +73,21 @@ class MultiProviderSTTService:
             except Exception as exc:
                 raise STTProviderError(f"Cannot create Groq client: {exc}") from exc
 
+        # Sniff audio magic bytes so Whisper gets the true container format (WebM/WAV/Ogg)
+        actual_name = filename or "audio.webm"
+        if file_bytes.startswith(b"\x1a\x45\xdf\xa3"):  # WebM / Matroska EBML
+            actual_name = "recording.webm"
+        elif file_bytes.startswith(b"OggS"):  # Ogg / Opus
+            actual_name = "recording.ogg"
+        elif file_bytes.startswith(b"RIFF"):  # RIFF WAV
+            actual_name = "recording.wav"
+        elif file_bytes.startswith(b"ID3") or file_bytes.startswith(b"\xff\xfb"):  # MP3
+            actual_name = "recording.mp3"
+
         try:
-            logger.info("STT → Groq Whisper Large v3")
+            logger.info("STT → Groq Whisper Large v3 (container: %s)", actual_name)
             transcription = await self._groq_client.audio.transcriptions.create(  # type: ignore[union-attr]
-                file=(filename, file_bytes),
+                file=(actual_name, file_bytes),
                 model="whisper-large-v3",
                 response_format="json",
                 language=language if language not in ("auto", "en") else None,

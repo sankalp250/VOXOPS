@@ -40,15 +40,20 @@ if settings.LANGSMITH_API_KEY:
 
 
 # ---------------------------------------------------------------------------
-# LLM Factory
 # ---------------------------------------------------------------------------
+# LLM Factory & Shared Client Cache
+# ---------------------------------------------------------------------------
+_llm_cache: Dict[float, ChatGroq] = {}
+
 def _build_llm(temperature: float = 0.0) -> ChatGroq:
-    return ChatGroq(
-        model="deepseek-r1-distill-llama-70b",
-        api_key=settings.GROQ_API_KEY or "sk-placeholder",
-        temperature=temperature,
-        max_tokens=512,
-    )
+    if temperature not in _llm_cache:
+        _llm_cache[temperature] = ChatGroq(
+            model="llama-3.3-70b-versatile",
+            api_key=settings.GROQ_API_KEY or "sk-placeholder",
+            temperature=temperature,
+            max_tokens=512,
+        )
+    return _llm_cache[temperature]
 
 
 def _get_client_config(state: AgentState) -> ClientConfig:
@@ -99,9 +104,9 @@ def node_memory_retrieve(state: AgentState) -> AgentState:
 
 
 # ---------------------------------------------------------------------------
-# Node 4: Dynamic Intent Detection
+# Node 4: Dynamic Intent Detection (Async Non-Blocking)
 # ---------------------------------------------------------------------------
-def node_intent_detect(state: AgentState) -> AgentState:
+async def node_intent_detect(state: AgentState) -> AgentState:
     cfg = _get_client_config(state)
     transcript = state.get("transcript", "") or ""
     lang = state.get("language_code", "en")
@@ -125,7 +130,7 @@ def node_intent_detect(state: AgentState) -> AgentState:
     intent = "unknown"
     try:
         llm = _build_llm()
-        resp = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=transcript)])
+        resp = await llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=transcript)])
         candidate = str(resp.content).strip().lower().split()[0].strip(".,")
         if candidate in cfg.intent_labels:
             intent = candidate
@@ -137,9 +142,9 @@ def node_intent_detect(state: AgentState) -> AgentState:
 
 
 # ---------------------------------------------------------------------------
-# Node 5: Dynamic Slot Filling
+# Node 5: Dynamic Slot Filling (Async Non-Blocking)
 # ---------------------------------------------------------------------------
-def node_slot_fill(state: AgentState) -> AgentState:
+async def node_slot_fill(state: AgentState) -> AgentState:
     cfg = _get_client_config(state)
     transcript = state.get("transcript", "") or ""
     intent = state.get("intent", "unknown")
@@ -167,7 +172,7 @@ def node_slot_fill(state: AgentState) -> AgentState:
     slots: Dict[str, Any] = {}
     try:
         llm = _build_llm()
-        resp = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=transcript)])
+        resp = await llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=transcript)])
         raw = str(resp.content).strip()
         if "```" in raw:
             raw = raw.split("```")[1].replace("json", "").strip()
@@ -180,7 +185,7 @@ def node_slot_fill(state: AgentState) -> AgentState:
 
 
 # ---------------------------------------------------------------------------
-# Node 6: Dynamic Tool Execution
+# Node 6: Dynamic Tool Execution (Native Async)
 # ---------------------------------------------------------------------------
 async def _call_real_api(api_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -189,13 +194,13 @@ async def _call_real_api(api_url: str, payload: Dict[str, Any]) -> Dict[str, Any
         return dict(resp.json())
 
 
-def node_tool_execute(state: AgentState) -> AgentState:
+async def node_tool_execute(state: AgentState) -> AgentState:
     cfg = _get_client_config(state)
     intent = state.get("intent", "unknown")
     slots = state.get("slots") or {}
 
     if not cfg.tools:
-        return {**state, "tool_result": {"status": "no_tools", "message": "No tools configured."}}
+        return {**state, "tool_result": {"status": "conversational", "message": "Conversational reply."}}
 
     matched_tool: ToolSchema = cfg.tools[0]
     for tool in cfg.tools:
@@ -213,10 +218,8 @@ def node_tool_execute(state: AgentState) -> AgentState:
             "data": slots,
         }
     else:
-        import asyncio
         try:
-            loop = asyncio.get_event_loop()
-            result = loop.run_until_complete(_call_real_api(matched_tool.api_url, payload))
+            result = await _call_real_api(matched_tool.api_url, payload)
         except Exception as exc:
             logger.error("[tool_execute] API call failed for '%s': %s", matched_tool.name, exc)
             result = {"status": "error", "message": str(exc)}
@@ -226,9 +229,9 @@ def node_tool_execute(state: AgentState) -> AgentState:
 
 
 # ---------------------------------------------------------------------------
-# Node 7: Dynamic Response Generation (with Memory Context)
+# Node 7: Dynamic Response Generation (with Memory Context, Async)
 # ---------------------------------------------------------------------------
-def node_respond(state: AgentState) -> AgentState:
+async def node_respond(state: AgentState) -> AgentState:
     cfg = _get_client_config(state)
     tool_result = state.get("tool_result") or {}
     intent = state.get("intent", "unknown")
@@ -258,10 +261,15 @@ def node_respond(state: AgentState) -> AgentState:
         f"Tool result: {json.dumps(tool_result, ensure_ascii=False)}"
     )
 
-    response_text = str(tool_result.get("message", "Done!"))
+    # Friendly conversational default in case tool output is purely internal or LLM unreachable
+    fallback_response = f"Hi! I am {cfg.name}. How can I help you today?"
+    if tool_result.get("status") == "success" and tool_result.get("message"):
+        fallback_response = str(tool_result.get("message"))
+
+    response_text = fallback_response
     try:
         llm = _build_llm(temperature=0.3)
-        resp = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_content)])
+        resp = await llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=user_content)])
         response_text = str(resp.content).strip()
     except Exception as exc:
         logger.warning("[respond] LLM failed: %s", exc)
