@@ -42,14 +42,25 @@ class EmbeddingService:
         # 1. Try Google Gemini Embeddings if API key is present
         if self._gemini_available and settings.GOOGLE_API_KEY:
             try:
-                import google.genai as genai
-                client = genai.Client(api_key=settings.GOOGLE_API_KEY)
-                res = client.models.embed_content(
-                    model="text-embedding-004",
-                    contents=clean_text,
-                )
-                if res and res.embedding and res.embedding.values:
-                    return [float(v) for v in res.embedding.values]
+                try:
+                    import google.genai as genai
+                    client = genai.Client(api_key=settings.GOOGLE_API_KEY)
+                    res = client.models.embed_content(
+                        model="text-embedding-004",
+                        contents=clean_text,
+                    )
+                    if res and res.embedding and res.embedding.values:
+                        return [float(v) for v in res.embedding.values]
+                except (ImportError, AttributeError):
+                    import google.generativeai as legacy_genai
+                    legacy_genai.configure(api_key=settings.GOOGLE_API_KEY)
+                    result = legacy_genai.embed_content(
+                        model="models/embedding-001",
+                        content=clean_text,
+                        task_type="retrieval_document",
+                    )
+                    if result and "embedding" in result:
+                        return [float(v) for v in result["embedding"]]
             except Exception as e:
                 logger.warning(f"Google Gemini embedding failed: {e}. Using deterministic normalized embedding.")
 
@@ -61,14 +72,17 @@ class EmbeddingService:
     def _generate_deterministic_vector(text: str, dim: int = 768) -> List[float]:
         """
         Generates a deterministic, cosine-searchable unit vector for testing and offline fallback.
+        Uses CRC32 hashing to guarantee consistency across process restarts.
         """
-        words = text.lower().split()
+        import zlib
+        import re
+
+        words = re.sub(r"[^\w\s]", " ", text.lower()).split()
         vec = [0.0] * dim
         for i, word in enumerate(words):
-            h = hash(word)
-            idx = abs(h) % dim
-            sign = 1.0 if (h > 0) else -1.0
-            vec[idx] += sign / (i + 1.0)
+            h = zlib.crc32(word.encode("utf-8"))
+            idx = h % dim
+            vec[idx] += 1.0 / (1.0 + (i * 0.05))
 
         # Normalize to unit length
         norm = math.sqrt(sum(x * x for x in vec))
