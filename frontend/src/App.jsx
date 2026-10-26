@@ -1,15 +1,17 @@
 import React, { useState, useEffect } from 'react';
-import { Mic, Building2, Database, BarChart3, ArrowLeft, LogOut } from 'lucide-react';
+import { Mic, Building2, Database, BarChart3, ArrowLeft, LogOut, Volume2 } from 'lucide-react';
 import LandingPage from './components/LandingPage';
 import AuthModal from './components/AuthModal';
 import ClientConfigurator from './components/ClientConfigurator';
 import VoicePlayground from './components/VoicePlayground';
+import AgentVoices from './components/AgentVoices';
 import VectorMemoryInspector from './components/VectorMemoryInspector';
 import TelemetryDashboard from './components/TelemetryDashboard';
 import { fetchClients } from './services/api';
 
 const TABS = [
   { id: 'playground',    label: 'Voice Playground', icon: <Mic size={14} /> },
+  { id: 'voices',        label: 'Agent Voices',     icon: <Volume2 size={14} /> },
   { id: 'configurator',  label: 'Dynamic Builder',  icon: <Building2 size={14} /> },
   { id: 'memory',        label: 'Vector Memory',    icon: <Database size={14} /> },
   { id: 'telemetry',     label: 'Telemetry',        icon: <BarChart3 size={14} /> },
@@ -20,6 +22,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('playground');
   const [clients, setClients] = useState([]);
   const [activeClient, setActiveClient] = useState(null);
+  const [activeVoice, setActiveVoice] = useState(null);
   const [isAuthOpen, setIsAuthOpen] = useState(false);
   const [currentUser, setCurrentUser] = useState(null);
 
@@ -27,9 +30,35 @@ export default function App() {
     const savedUser = localStorage.getItem('voxops_user');
     if (savedUser) setCurrentUser(JSON.parse(savedUser));
     fetchClients()
-      .then(list => { setClients(list); if (list.length > 0) setActiveClient(list[0]); })
+      .then(list => {
+        setClients(list);
+        if (list.length > 0) setActiveClient(list[0]);
+      })
       .catch(console.error);
   }, []);
+
+  // Update active voice when activeClient changes
+  useEffect(() => {
+    if (!activeClient) return;
+    const key = `voxops_voice_${activeClient.id}`;
+    const saved = localStorage.getItem(key);
+    if (saved) {
+      try {
+        setActiveVoice(JSON.parse(saved));
+        return;
+      } catch {
+        // fallback below
+      }
+    }
+    // High quality female defaults (Jessica for EN, Ritu for HI)
+    const isHindi = activeClient.language_code?.toLowerCase().startsWith('hi');
+    setActiveVoice({
+      id: isHindi ? 'sarvam:ritu' : 'elevenlabs:cgSgspJ2msm6clMCkdW9',
+      name: isHindi ? 'Ritu' : 'Jessica',
+      provider: isHindi ? 'sarvam' : 'elevenlabs',
+      gender: 'female',
+    });
+  }, [activeClient?.id]);
 
   function handleLogout() {
     localStorage.removeItem('voxops_user');
@@ -40,6 +69,13 @@ export default function App() {
   function handleClientSaved(c) {
     setActiveClient(c);
     setClients(prev => prev.some(x => x.id === c.id) ? prev : [...prev, c]);
+  }
+
+  function handleVoiceSelected(voice) {
+    setActiveVoice(voice);
+    if (activeClient) {
+      localStorage.setItem(`voxops_voice_${activeClient.id}`, JSON.stringify(voice));
+    }
   }
 
   return (
@@ -124,7 +160,20 @@ export default function App() {
 
           {/* Main content */}
           <main className="console-main">
-            {activeTab === 'playground'   && <VoicePlayground activeClient={activeClient} />}
+            {activeTab === 'playground'   && (
+              <VoicePlayground
+                activeClient={activeClient}
+                activeVoice={activeVoice}
+                onNavigateToVoices={() => setActiveTab('voices')}
+              />
+            )}
+            {activeTab === 'voices'       && (
+              <AgentVoices
+                activeClient={activeClient}
+                activeVoice={activeVoice}
+                onSelectVoice={handleVoiceSelected}
+              />
+            )}
             {activeTab === 'configurator' && <ClientConfigurator activeClient={activeClient} onSelectClient={handleClientSaved} />}
             {activeTab === 'memory'       && <VectorMemoryInspector activeClient={activeClient} />}
             {activeTab === 'telemetry'    && <TelemetryDashboard activeClient={activeClient} />}

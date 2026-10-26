@@ -171,12 +171,14 @@ class AgentRunRequest:
 
 
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List, Dict
 
 class AgentRunBody(BaseModel):
     transcript: str
     language_code: Optional[str] = None
     client_id: Optional[str] = None   # alternative to API key header
+    session_id: Optional[str] = None
+    chat_history: Optional[List[Dict[str, str]]] = None
 
 
 class AgentRunResponse(BaseModel):
@@ -220,12 +222,21 @@ async def agent_run(
     # 1. Resolve client config
     cfg = await _resolve_client(db, api_key=x_client_api_key, client_id=body.client_id)
 
-    # 2. Create voice session
-    voice_session = await VoiceSessionRepository.create_session(
-        db=db,
-        title=f"Agent Turn — {body.transcript[:40]}",
-        language_code=body.language_code or cfg.language_code,
-    )
+    # 2. Create or reuse voice session
+    voice_session = None
+    if body.session_id:
+        try:
+            sess_uuid = _uuid.UUID(body.session_id)
+            voice_session = await VoiceSessionRepository.get_session(db, sess_uuid)
+        except Exception:
+            voice_session = None
+
+    if not voice_session:
+        voice_session = await VoiceSessionRepository.create_session(
+            db=db,
+            title=f"Agent Turn — {body.transcript[:40]}",
+            language_code=body.language_code or cfg.language_code,
+        )
 
     # 3. Retrieve relevant client vector memory (RAG)
     from app.services.memory_service import memory_service
@@ -236,7 +247,7 @@ async def agent_run(
         top_k=2,
     )
 
-    # 4. Run the dynamic VoxGuard graph with injected memory
+    # 4. Run the dynamic VoxGuard graph with injected memory & conversation context
     try:
         final_state = await run_agent(
             transcript=body.transcript,
@@ -244,6 +255,7 @@ async def agent_run(
             language_code=body.language_code,
             session_id=str(voice_session.id),
             memory_context=retrieved_memory,
+            messages=body.chat_history,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Agent error: {exc}") from exc
@@ -263,7 +275,7 @@ async def agent_run(
     await VoiceSessionRepository.log_agent_execution(
         db=db, session_id=voice_session.id, agent_name="VoxGuard-Dynamic",
         stt_provider="upstream", tts_provider="pending",
-        llm_model="llama-3.3-70b-versatile",
+        llm_model="openai/gpt-oss-120b",
         thought_process={"intent": final_state.get("intent"), "slots": final_state.get("slots")},
         turn_latency_ms=latency,
         guardrail_verdict="blocked" if guardrail else "approved",

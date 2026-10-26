@@ -55,7 +55,7 @@ export async function getClientById(clientId) {
   return handleResponse(res);
 }
 
-export async function runAgentTurn({ transcript, clientId, apiKey, languageCode = 'en' }) {
+export async function runAgentTurn({ transcript, clientId, apiKey, languageCode = 'en', sessionId, chatHistory = [] }) {
   const headers = { 'Content-Type': 'application/json' };
   if (apiKey) {
     headers['X-Client-API-Key'] = apiKey;
@@ -63,6 +63,8 @@ export async function runAgentTurn({ transcript, clientId, apiKey, languageCode 
   const body = {
     transcript,
     language_code: languageCode,
+    session_id: sessionId || undefined,
+    chat_history: chatHistory || [],
   };
   if (!apiKey && clientId) {
     body.client_id = clientId;
@@ -143,14 +145,17 @@ export async function checkSystemHealth() {
 }
 
 /**
- * Calls the backend TTS engine (Deepgram Aura / Sarvam Bulbul / ElevenLabs) and plays
- * the returned audio. Falls back to browser speech synthesis only when the backend is offline.
+ * Calls the backend TTS engine (ElevenLabs / Deepgram Aura / Sarvam Bulbul) and plays
+ * the returned audio. Supports explicit voiceId override. Falls back to browser speech
+ * synthesis only when the backend is offline.
  *
- * @param {string} text          - Text to speak
- * @param {string} languageCode  - ISO language code (en, hi, ta, …)
+ * @param {string} text               - Text to speak
+ * @param {string} languageCode       - ISO language code (en, hi, ta, …)
+ * @param {string|null} voiceId       - Specific voice ID (e.g. "elevenlabs:cgSgspJ2msm6clMCkdW9")
+ * @param {string} preferredProvider  - "auto" | "elevenlabs" | "deepgram" | "sarvam"
  * @returns {Promise<HTMLAudioElement|null>} The playing Audio element, or null on failure
  */
-export async function synthesizeSpeech(text, languageCode = 'en') {
+export async function synthesizeSpeech(text, languageCode = 'en', voiceId = null, preferredProvider = 'auto') {
   if (!text || !text.trim()) return null;
 
   try {
@@ -160,7 +165,8 @@ export async function synthesizeSpeech(text, languageCode = 'en') {
       body: JSON.stringify({
         text: text.trim(),
         language_code: languageCode,
-        preferred_provider: 'auto',
+        preferred_provider: preferredProvider || 'auto',
+        voice_id: voiceId || undefined,
       }),
     });
 
@@ -182,4 +188,41 @@ export async function synthesizeSpeech(text, languageCode = 'en') {
     }
     return null;
   }
+}
+
+/**
+ * Fetches the curated catalog of agent voices across ElevenLabs, Deepgram, and Sarvam.
+ */
+export async function fetchVoices() {
+  const res = await fetch(`${API_BASE}/audio/voices`);
+  return handleResponse(res);
+}
+
+/**
+ * Requests and plays a real-time sample audition for a specific voice.
+ *
+ * @param {string} voiceId    - Voice ID to preview
+ * @param {string} provider   - "elevenlabs" | "deepgram" | "sarvam" | "auto"
+ * @param {string} text       - Optional custom preview text
+ * @returns {Promise<HTMLAudioElement>} The playing Audio element
+ */
+export async function previewVoice({ voiceId, provider = 'auto', text = null }) {
+  const res = await fetch(`${API_BASE}/audio/voices/preview`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      voice_id: voiceId,
+      provider: provider || 'auto',
+      text: text || undefined,
+    }),
+  });
+
+  if (!res.ok) throw new Error(`Voice preview failed (${res.status})`);
+
+  const blob = await res.blob();
+  const url  = URL.createObjectURL(blob);
+  const audio = new Audio(url);
+  audio.onended = () => URL.revokeObjectURL(url);
+  await audio.play();
+  return audio;
 }

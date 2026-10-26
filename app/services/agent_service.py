@@ -18,7 +18,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import httpx
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 from langgraph.graph import END, START, StateGraph
 
@@ -48,7 +48,7 @@ _llm_cache: Dict[float, ChatGroq] = {}
 def _build_llm(temperature: float = 0.0) -> ChatGroq:
     if temperature not in _llm_cache:
         _llm_cache[temperature] = ChatGroq(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             api_key=settings.GROQ_API_KEY or "sk-placeholder",
             temperature=temperature,
             max_tokens=512,
@@ -269,7 +269,23 @@ async def node_respond(state: AgentState) -> AgentState:
     response_text = fallback_response
     try:
         llm = _build_llm(temperature=0.3)
-        resp = await llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=user_content)])
+        # Construct multi-turn message history for full context awareness
+        llm_messages = [SystemMessage(content=system_prompt)]
+
+        # Inject past turns if available (excluding current turn)
+        past_msgs = state.get("messages") or []
+        for msg in past_msgs[:-1]:
+            r = msg.get("role", "")
+            c = msg.get("content") or msg.get("text") or ""
+            if r in {"user", "human"} and c:
+                llm_messages.append(HumanMessage(content=c))
+            elif r in {"assistant", "ai", "bot"} and c:
+                llm_messages.append(AIMessage(content=c))
+
+        # Append current user utterance with tool metadata
+        llm_messages.append(HumanMessage(content=user_content))
+
+        resp = await llm.ainvoke(llm_messages)
         response_text = str(resp.content).strip()
     except Exception as exc:
         logger.warning("[respond] LLM failed: %s", exc)
@@ -325,15 +341,30 @@ async def run_agent(
     language_code: str | None = None,
     session_id: str = "",
     memory_context: Optional[List[Dict[str, Any]]] = None,
+    messages: Optional[List[Dict[str, str]]] = None,
 ) -> AgentState:
     t0 = time.monotonic()
+
+    # Build sanitized multi-turn conversation messages list
+    chat_msgs: List[Dict[str, str]] = []
+    if messages:
+        for m in messages:
+            r = m.get("role")
+            c = m.get("content") or m.get("text") or ""
+            if r and c:
+                chat_msgs.append({"role": r, "content": str(c)})
+
+    # Ensure the latest user turn is appended at the end
+    if not chat_msgs or chat_msgs[-1].get("content") != transcript:
+        chat_msgs.append({"role": "user", "content": transcript})
+
     initial_state: AgentState = {
         "transcript": transcript,
         "language_code": language_code or client_config.language_code,
         "session_id": session_id,
         "client_config": client_config,  # type: ignore[typeddict-item]
         "memory_context": memory_context or [],
-        "messages": [{"role": "user", "content": transcript}],
+        "messages": chat_msgs,
     }
     final_state: AgentState = await voxguard_graph.ainvoke(initial_state)
     final_state["turn_latency_ms"] = int((time.monotonic() - t0) * 1000)

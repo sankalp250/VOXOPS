@@ -35,16 +35,16 @@ class MultiProviderTTSService:
 
     # Sarvam voice map: language prefix -> (speaker, model)
     _SARVAM_VOICES: Dict[str, Tuple[str, str]] = {
-        "en":  ("simran_en_conversation", "bulbul:v2"),
-        "hi":  ("ritu_hi_conversation",   "bulbul:v2"),
-        "ta":  ("gokul_ta_narration",     "bulbul:v2"),
-        "te":  ("kavitha_te_conversation","bulbul:v2"),
-        "kn":  ("chaitra_kn_conversation","bulbul:v2"),
-        "bn":  ("arnab_bn_conversation",  "bulbul:v2"),
-        "mr":  ("nilesh_mr_conversation", "bulbul:v2"),
-        "gu":  ("bhavik_gu_conversation", "bulbul:v2"),
-        "pa":  ("anand_pa_conversation",  "bulbul:v2"),
-        "ml":  ("anushka",               "bulbul:v2"),
+        "en":  ("simran", "bulbul:v3"),
+        "hi":  ("ritu",   "bulbul:v3"),
+        "ta":  ("gokul",  "bulbul:v3"),
+        "te":  ("kavitha","bulbul:v3"),
+        "kn":  ("roopa",  "bulbul:v3"),
+        "bn":  ("shreya", "bulbul:v3"),
+        "mr":  ("rupali", "bulbul:v3"),
+        "gu":  ("priya",  "bulbul:v3"),
+        "pa":  ("simran", "bulbul:v3"),
+        "ml":  ("kavitha","bulbul:v3"),
     }
 
     async def synthesize_sarvam(
@@ -52,9 +52,10 @@ class MultiProviderTTSService:
         text: str,
         language_code: str = "en",
         speaker: Optional[str] = None,
+        model: str = "bulbul:v3",
     ) -> bytes:
         """
-        Synthesize speech using Sarvam Bulbul v2 TTS API.
+        Synthesize speech using Sarvam Bulbul v3 TTS API.
         Automatically selects the correct speaker for the given language.
         """
         if not self._sarvam_key:
@@ -62,8 +63,9 @@ class MultiProviderTTSService:
 
         lang_prefix = language_code.split("-")[0].lower()
         lang_bcp47  = language_code if "-" in language_code else f"{lang_prefix}-IN"
-        default_speaker, model = self._SARVAM_VOICES.get(lang_prefix, ("anushka", "bulbul:v2"))
+        default_speaker, default_model = self._SARVAM_VOICES.get(lang_prefix, ("ritu", "bulbul:v3"))
         chosen_speaker = speaker or default_speaker
+        chosen_model = model or default_model
 
         headers = {
             "api-subscription-key": self._sarvam_key,
@@ -78,7 +80,7 @@ class MultiProviderTTSService:
             "loudness": 1.5,
             "speech_sample_rate": 22050,
             "enable_preprocessing": True,
-            "model": model,
+            "model": chosen_model,
         }
 
         try:
@@ -98,7 +100,7 @@ class MultiProviderTTSService:
     async def synthesize_elevenlabs(
         self,
         text: str,
-        voice_id: str = "cgSgspJ2msm6clMCkdW9",  # Jessica - Playful, Bright, Warm (free premade)
+        voice_id: str = "cgSgspJ2msm6clMCkdW9",  # Jessica - Playful, Bright, Warm Female
     ) -> bytes:
         """
         Synthesize speech using ElevenLabs Turbo v2.5.
@@ -137,7 +139,7 @@ class MultiProviderTTSService:
     async def synthesize_deepgram(
         self,
         text: str,
-        model: str = "aura-asteria-en",
+        model: str = "aura-asteria-en",  # Asteria - Conversational Female
     ) -> bytes:
         """
         Synthesize speech using Deepgram Aura TTS.
@@ -183,9 +185,11 @@ class MultiProviderTTSService:
         text: str,
         language_code: str = "en",
         preferred_provider: str = "auto",
+        voice_id: Optional[str] = None,
     ) -> Tuple[bytes, str, int]:
         """
         Synthesizes speech with automatic resilient multi-provider failover.
+        Supports explicit voice selection across ElevenLabs, Deepgram, and Sarvam.
 
         Returns:
             Tuple of (audio_bytes, provider_used, latency_ms)
@@ -196,30 +200,54 @@ class MultiProviderTTSService:
 
         clean_text = text.strip()
         _indian_langs = {"hi", "ta", "te", "kn", "mr", "bn", "gu", "pa", "ml"}
-        is_indian = language_code.split("-")[0].lower() in _indian_langs
+        lang_prefix = language_code.split("-")[0].lower()
+        is_indian = lang_prefix in _indian_langs
 
-        # Determine priority chain
-        # Indian languages: Sarvam first (best quality for IN langs)
-        # English: Deepgram Aura (fastest) → Sarvam EN → ElevenLabs (needs valid sk_ key)
-        if preferred_provider == "sarvam" or (preferred_provider == "auto" and is_indian):
+        # Parse provider and raw voice from voice_id if formatted like "provider:voice"
+        target_provider = preferred_provider
+        target_voice = voice_id
+
+        if voice_id and ":" in voice_id:
+            parts = voice_id.split(":", 1)
+            target_provider = parts[0].lower()
+            target_voice = parts[1]
+        elif voice_id:
+            if voice_id.startswith("aura-"):
+                target_provider = "deepgram"
+            elif voice_id in {"ritu", "simran", "priya", "neha", "pooja", "kavya", "gokul", "aditya"}:
+                target_provider = "sarvam"
+            elif len(voice_id) == 20:  # ElevenLabs standard voice id length
+                target_provider = "elevenlabs"
+
+        # Dedicated voice dispatch if a specific provider is requested
+        if target_provider == "elevenlabs":
+            v = target_voice or "cgSgspJ2msm6clMCkdW9"  # Jessica
             providers = [
-                ("sarvam",    lambda: self.synthesize_sarvam(clean_text, language_code)),
-                ("deepgram",  lambda: self.synthesize_deepgram(clean_text)),
-                ("elevenlabs",lambda: self.synthesize_elevenlabs(clean_text)),
+                ("elevenlabs", lambda: self.synthesize_elevenlabs(clean_text, voice_id=v)),
+                ("deepgram",   lambda: self.synthesize_deepgram(clean_text, model="aura-asteria-en")),
+                ("sarvam",     lambda: self.synthesize_sarvam(clean_text, language_code, speaker="simran")),
             ]
-        elif preferred_provider == "elevenlabs":
+        elif target_provider == "deepgram":
+            m = target_voice or "aura-asteria-en"
             providers = [
-                ("elevenlabs",lambda: self.synthesize_elevenlabs(clean_text)),
-                ("deepgram",  lambda: self.synthesize_deepgram(clean_text)),
-                ("sarvam",    lambda: self.synthesize_sarvam(clean_text, language_code)),
+                ("deepgram",   lambda: self.synthesize_deepgram(clean_text, model=m)),
+                ("elevenlabs", lambda: self.synthesize_elevenlabs(clean_text, voice_id="cgSgspJ2msm6clMCkdW9")),
+                ("sarvam",     lambda: self.synthesize_sarvam(clean_text, language_code, speaker="simran")),
+            ]
+        elif target_provider == "sarvam" or (target_provider == "auto" and is_indian):
+            spk = target_voice if (target_provider == "sarvam" and target_voice) else None
+            providers = [
+                ("sarvam",     lambda: self.synthesize_sarvam(clean_text, language_code, speaker=spk)),
+                ("deepgram",   lambda: self.synthesize_deepgram(clean_text, model="aura-asteria-en")),
+                ("elevenlabs", lambda: self.synthesize_elevenlabs(clean_text, voice_id="cgSgspJ2msm6clMCkdW9")),
             ]
         else:
-            # English path: ElevenLabs first (premium voice, free premade voices work)
-            # then Deepgram Aura, then Sarvam EN as final fallback
+            # Default auto path for English:
+            # ElevenLabs (Jessica - Female) -> Deepgram (Asteria - Female) -> Sarvam (Simran - Female)
             providers = [
-                ("elevenlabs",lambda: self.synthesize_elevenlabs(clean_text)),
-                ("deepgram",  lambda: self.synthesize_deepgram(clean_text)),
-                ("sarvam",    lambda: self.synthesize_sarvam(clean_text, language_code)),
+                ("elevenlabs", lambda: self.synthesize_elevenlabs(clean_text, voice_id="cgSgspJ2msm6clMCkdW9")),
+                ("deepgram",   lambda: self.synthesize_deepgram(clean_text, model="aura-asteria-en")),
+                ("sarvam",     lambda: self.synthesize_sarvam(clean_text, language_code, speaker="simran")),
             ]
 
         for name, fn in providers:

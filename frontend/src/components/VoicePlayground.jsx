@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Mic, MicOff, Send, Trash2, Bot, User, Loader2, Volume2, VolumeX, RefreshCw } from 'lucide-react';
+import { Mic, MicOff, Send, Trash2, Bot, User, Loader2, Volume2, VolumeX, RefreshCw, Radio, Sparkles } from 'lucide-react';
 import { runAgentTurn, transcribeAudio, synthesizeSpeech } from '../services/api';
 
 /* ─── helpers ─── */
@@ -7,18 +7,47 @@ function formatTime(d = new Date()) {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-export default function VoicePlayground({ activeClient }) {
-  const [messages, setMessages] = useState([]);          // { id, role, text, time, latency, intent }
-  const [input, setInput]       = useState('');
-  const [recording, setRecording] = useState(false);
-  const [thinking, setThinking]  = useState(false);
-  const [muted, setMuted]        = useState(false);
-  const [error, setError]        = useState(null);
+function formatDuration(seconds) {
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m}:${s < 10 ? '0' : ''}${s}`;
+}
 
-  const bottomRef    = useRef(null);
-  const recorderRef  = useRef(null);
-  const chunksRef    = useRef([]);
-  const audioRef     = useRef(null);  // currently playing TTS audio element
+export default function VoicePlayground({ activeClient, activeVoice, onNavigateToVoices }) {
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState('');
+  const [recording, setRecording] = useState(false);
+  const [recordSeconds, setRecordSeconds] = useState(0);
+  const [thinking, setThinking] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const [continuousMode, setContinuousMode] = useState(false);
+  const [error, setError] = useState(null);
+  const [sessionId, setSessionId] = useState(() => 'sess_' + Math.random().toString(36).slice(2, 9));
+
+  const bottomRef = useRef(null);
+  const recorderRef = useRef(null);
+  const chunksRef = useRef([]);
+  const audioRef = useRef(null);
+  const timerIntervalRef = useRef(null);
+  const recStartTimeRef = useRef(0);
+
+  // Sync refs for event handlers and speech synthesis onended
+  const continuousRef = useRef(continuousMode);
+  continuousRef.current = continuousMode;
+  const mutedRef = useRef(muted);
+  mutedRef.current = muted;
+  const thinkingRef = useRef(thinking);
+  thinkingRef.current = thinking;
+  const recordingRef = useRef(recording);
+  recordingRef.current = recording;
+
+  // Determine effective voice
+  const effectiveVoice = activeVoice || {
+    id: activeClient?.language_code === 'hi' ? 'sarvam:ritu' : 'elevenlabs:cgSgspJ2msm6clMCkdW9',
+    name: activeClient?.language_code === 'hi' ? 'Ritu' : 'Jessica',
+    provider: activeClient?.language_code === 'hi' ? 'sarvam' : 'elevenlabs',
+    gender: 'female',
+  };
 
   /* seed greeting when client changes */
   useEffect(() => {
@@ -30,27 +59,39 @@ export default function VoicePlayground({ activeClient }) {
       time: formatTime(),
     }]);
     setError(null);
+    setSessionId('sess_' + Math.random().toString(36).slice(2, 9));
   }, [activeClient?.id]);
 
   /* auto-scroll */
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, thinking]);
+  }, [messages, thinking, recording]);
 
-  /* send a text turn */
-  async function send(text) {
-    if (!text.trim() || !activeClient || thinking) return;
+  /* send a text turn with multi-turn conversation context */
+  const send = useCallback(async (text) => {
+    if (!text.trim() || !activeClient || thinkingRef.current) return;
+
     const userMsg = { id: Date.now(), role: 'user', text, time: formatTime() };
     setMessages(prev => [...prev, userMsg]);
     setInput('');
     setThinking(true);
     setError(null);
+
+    // Extract last 10 turns as conversational history
+    const chatHistory = messages.slice(-10).map(m => ({
+      role: m.role,
+      content: m.text,
+    }));
+
     try {
       const res = await runAgentTurn({
         transcript: text,
         clientId: activeClient.id,
         languageCode: activeClient.language_code,
+        sessionId,
+        chatHistory,
       });
+
       const asstMsg = {
         id: Date.now() + 1,
         role: 'assistant',
@@ -61,32 +102,64 @@ export default function VoicePlayground({ activeClient }) {
       };
       setMessages(prev => [...prev, asstMsg]);
 
-      /* speak via backend TTS (Deepgram Aura / Sarvam Bulbul) */
-      if (!muted && res.response_text) {
-        // Stop any currently playing audio before starting new
+      /* speak via chosen female voice (ElevenLabs Jessica / Deepgram Asteria / Sarvam Ritu) */
+      if (!mutedRef.current && res.response_text) {
         if (audioRef.current) {
           audioRef.current.pause();
           audioRef.current = null;
         }
+
         const lang = activeClient?.language_code || 'en';
-        audioRef.current = await synthesizeSpeech(res.response_text, lang);
+        const audio = await synthesizeSpeech(
+          res.response_text,
+          lang,
+          effectiveVoice.id,
+          effectiveVoice.provider,
+        );
+
+        if (audio) {
+          audioRef.current = audio;
+          audio.onended = () => {
+            audioRef.current = null;
+            // If continuous hands-free mode is ON, automatically re-arm mic for user reply!
+            if (continuousRef.current && !mutedRef.current) {
+              setTimeout(() => {
+                if (!recordingRef.current && !thinkingRef.current) {
+                  startRec();
+                }
+              }, 450);
+            }
+          };
+        }
       }
     } catch (err) {
       setError(err.message);
     } finally {
       setThinking(false);
     }
-  }
+  }, [activeClient, effectiveVoice, messages, sessionId]);
 
-  /* mic recording */
+  /* mic recording start */
   async function startRec() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const recorder = new MediaRecorder(stream);
       chunksRef.current = [];
-      recorder.ondataavailable = e => chunksRef.current.push(e.data);
+      recorder.ondataavailable = e => {
+        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
+      };
+
       recorder.onstop = async () => {
         stream.getTracks().forEach(t => t.stop());
+        clearInterval(timerIntervalRef.current);
+
+        const duration = Date.now() - recStartTimeRef.current;
+        if (duration < 400) {
+          setError('Recording was too short. Click once to start, speak clearly, then click again to finish.');
+          setRecording(false);
+          return;
+        }
+
         const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
         setThinking(true);
         try {
@@ -100,19 +173,42 @@ export default function VoicePlayground({ activeClient }) {
           setError(e.message);
         } finally {
           setThinking(false);
+          setRecording(false);
         }
       };
+
+      recStartTimeRef.current = Date.now();
+      setRecordSeconds(0);
+      timerIntervalRef.current = setInterval(() => {
+        setRecordSeconds(s => s + 1);
+      }, 1000);
+
       recorder.start();
       recorderRef.current = recorder;
       setRecording(true);
+      setError(null);
     } catch {
-      setError('Microphone access denied. Please enable mic permissions.');
+      setError('Microphone access denied. Please allow microphone permissions in browser.');
     }
   }
 
+  /* mic recording stop */
   function stopRec() {
-    recorderRef.current?.stop();
+    if (recorderRef.current && recorderRef.current.state !== 'inactive') {
+      recorderRef.current.stop();
+    }
+    clearInterval(timerIntervalRef.current);
     setRecording(false);
+  }
+
+  /* toggle recording (Click-to-Talk) */
+  function toggleRecording() {
+    if (thinking) return;
+    if (recording) {
+      stopRec();
+    } else {
+      startRec();
+    }
   }
 
   function clearConversation() {
@@ -124,14 +220,14 @@ export default function VoicePlayground({ activeClient }) {
       time: formatTime(),
     }]);
     setError(null);
-    // Stop any ongoing TTS audio on conversation clear
+    setSessionId('sess_' + Math.random().toString(36).slice(2, 9));
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current = null;
     }
   }
 
-  /* ─── empty state ─── */
+  /* empty state */
   if (!activeClient) {
     return (
       <div style={styles.emptyState}>
@@ -151,14 +247,40 @@ export default function VoicePlayground({ activeClient }) {
             <Bot size={20} color="#fff" />
           </div>
           <div>
-            <div style={{ fontWeight: '700', fontSize: '0.95rem' }}>{activeClient.name}</div>
-            <div style={{ fontSize: '0.72rem', color: 'var(--ink-light)', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+              <span style={{ fontWeight: '800', fontSize: '0.98rem' }}>{activeClient.name}</span>
+              <button
+                onClick={onNavigateToVoices}
+                style={styles.voiceBadgeBtn}
+                title="Click to audition & change agent voice"
+              >
+                <Sparkles size={11} color="#6B4FBB" />
+                <span>Voice: {effectiveVoice.name} ({effectiveVoice.gender})</span>
+              </button>
+            </div>
+            <div style={{ fontSize: '0.72rem', color: 'var(--ink-light)', display: 'flex', alignItems: 'center', gap: '0.35rem', marginTop: '0.1rem' }}>
               <span className="dot-live" />
-              Live · {activeClient.language_code?.toUpperCase()}
+              <span>Live · {activeClient.language_code?.toUpperCase()}</span>
+              <span>·</span>
+              <span>Context: Multi-turn Active</span>
             </div>
           </div>
         </div>
-        <div style={{ display: 'flex', gap: '0.5rem' }}>
+
+        {/* Action Controls */}
+        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+          {/* Continuous Voice Loop Toggle */}
+          <button
+            className={`btn btn-sm ${continuousMode ? 'btn-dark' : 'btn-outline'}`}
+            onClick={() => setContinuousMode(c => !c)}
+            title="Automatically re-opens microphone when the bot finishes speaking for continuous hands-free dialogue"
+            style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}
+          >
+            <Radio size={13} color={continuousMode ? '#4CAF50' : 'currentColor'} />
+            <span style={{ fontSize: '0.75rem' }}>{continuousMode ? 'Hands-Free: ON' : 'Hands-Free: OFF'}</span>
+          </button>
+
+          {/* Voice Output Mute Toggle */}
           <button
             className="btn btn-outline btn-sm"
             onClick={() => {
@@ -174,9 +296,11 @@ export default function VoicePlayground({ activeClient }) {
             title={muted ? 'Unmute agent voice' : 'Mute agent voice'}
           >
             {muted ? <VolumeX size={14} /> : <Volume2 size={14} />}
-            {muted ? 'Unmuted' : 'Voice On'}
+            {muted ? 'Muted' : 'Voice On'}
           </button>
-          <button className="btn btn-outline btn-sm" onClick={clearConversation} title="Clear conversation">
+
+          {/* Clear Session */}
+          <button className="btn btn-outline btn-sm" onClick={clearConversation} title="Clear conversation and reset session context">
             <Trash2 size={14} /> Clear
           </button>
         </div>
@@ -197,7 +321,7 @@ export default function VoicePlayground({ activeClient }) {
               </div>
               {/* Bubble */}
               <div style={{
-                maxWidth: '70%',
+                maxWidth: '75%',
                 background: msg.role === 'user' ? 'var(--ink)' : 'var(--cream-card)',
                 color: msg.role === 'user' ? '#fff' : 'var(--ink)',
                 border: msg.role === 'user' ? 'none' : '1px solid var(--border)',
@@ -233,37 +357,44 @@ export default function VoicePlayground({ activeClient }) {
           </div>
         )}
 
-        {/* Error */}
+        {/* Error Notification */}
         {error && (
-          <div style={{ background: 'var(--peach-bg)', border: '1px solid var(--peach)', borderRadius: 'var(--r-md)', padding: '0.75rem 1rem', fontSize: '0.85rem', color: '#B04A37', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-            ⚠ {error}
-            <button onClick={() => setError(null)} style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: '#B04A37', fontSize: '1rem' }}>×</button>
+          <div style={styles.errorBanner}>
+            <span>⚠ {error}</span>
+            <button onClick={() => setError(null)} style={styles.closeError}>×</button>
           </div>
         )}
 
         <div ref={bottomRef} />
       </div>
 
+      {/* ── Recording Live Status Pill ───────────────────── */}
+      {recording && (
+        <div style={styles.recordingBanner}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+            <span style={styles.recDot} />
+            <span style={{ fontWeight: '700', fontSize: '0.85rem' }}>Listening... ({formatDuration(recordSeconds)})</span>
+            <span style={{ fontSize: '0.75rem', opacity: 0.85 }}>Click the red button when done speaking</span>
+          </div>
+        </div>
+      )}
+
       {/* ── Input Bar ───────────────────────────────────── */}
       <div style={styles.inputBar}>
-        {/* Mic button */}
+        {/* Click-to-Talk Toggle Mic button */}
         <button
-          onMouseDown={startRec}
-          onMouseUp={stopRec}
-          onTouchStart={startRec}
-          onTouchEnd={stopRec}
+          type="button"
+          onClick={toggleRecording}
           disabled={thinking}
-          title="Hold to speak"
+          title={recording ? 'Click to stop and send voice' : 'Click once to start speaking'}
           style={{
-            width: '44px', height: '44px', borderRadius: '50%', flexShrink: 0,
-            background: recording ? '#E53E3E' : 'var(--ink)',
-            border: 'none', cursor: 'pointer',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            transition: 'background 0.2s',
-            boxShadow: recording ? '0 0 0 6px rgba(229,62,62,0.2)' : 'none',
+            ...styles.micBtn,
+            background: recording ? '#D32F2F' : 'var(--ink)',
+            boxShadow: recording ? '0 0 0 6px rgba(211,47,47,0.25)' : 'none',
+            transform: recording ? 'scale(1.05)' : 'scale(1)',
           }}
         >
-          {recording ? <MicOff size={18} color="#fff" /> : <Mic size={18} color="#fff" />}
+          {recording ? <MicOff size={20} color="#fff" /> : <Mic size={20} color="#fff" />}
         </button>
 
         {/* Text input */}
@@ -273,7 +404,7 @@ export default function VoicePlayground({ activeClient }) {
         >
           <input
             className="input"
-            placeholder={recording ? '🎤 Listening...' : `Message ${activeClient.name}...`}
+            placeholder={recording ? '🎤 Recording in progress... click mic to finish' : `Message ${activeClient.name}...`}
             value={input}
             onChange={e => setInput(e.target.value)}
             disabled={thinking || recording}
@@ -282,13 +413,13 @@ export default function VoicePlayground({ activeClient }) {
           />
           <button
             type="submit"
-            disabled={!input.trim() || thinking}
+            disabled={!input.trim() || thinking || recording}
             style={{
               width: '44px', height: '44px', borderRadius: '50%', flexShrink: 0,
-              background: input.trim() && !thinking ? 'var(--ink)' : 'var(--cream-dark)',
+              background: input.trim() && !thinking && !recording ? 'var(--ink)' : 'var(--cream-dark)',
               border: '1.5px solid var(--border)',
               display: 'flex', alignItems: 'center', justifyContent: 'center',
-              cursor: input.trim() && !thinking ? 'pointer' : 'not-allowed',
+              cursor: input.trim() && !thinking && !recording ? 'pointer' : 'not-allowed',
               transition: 'all 0.2s',
             }}
           >
@@ -302,6 +433,8 @@ export default function VoicePlayground({ activeClient }) {
 
       <style>{`
         @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes pulse-dot { 0%, 100% { opacity: 0.3; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1.2); } }
+        @keyframes rec-pulse { 0% { transform: scale(0.95); opacity: 0.7; } 50% { transform: scale(1.2); opacity: 1; } 100% { transform: scale(0.95); opacity: 0.7; } }
       `}</style>
     </div>
   );
@@ -311,48 +444,113 @@ const styles = {
   shell: {
     display: 'flex',
     flexDirection: 'column',
-    height: 'calc(100vh - 61px)',  /* full height minus header */
+    height: 'calc(100vh - 61px)',
     background: 'var(--cream-soft)',
     borderRadius: 'var(--r-xl)',
     border: '1px solid var(--border)',
     overflow: 'hidden',
-    maxWidth: '800px',
+    maxWidth: '850px',
     margin: '0 auto',
   },
   chatHeader: {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'space-between',
-    padding: '1rem 1.5rem',
+    padding: '0.85rem 1.25rem',
     background: 'var(--cream-card)',
     borderBottom: '1px solid var(--border)',
     flexShrink: 0,
+    flexWrap: 'wrap',
+    gap: '0.75rem',
   },
   agentAvatar: {
-    width: '36px',
-    height: '36px',
+    width: '38px',
+    height: '38px',
     borderRadius: '50%',
     background: 'var(--ink)',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
   },
+  voiceBadgeBtn: {
+    background: '#F3E5F5',
+    border: '1px solid #E1BEE7',
+    borderRadius: 'var(--r-pill)',
+    padding: '0.15rem 0.6rem',
+    fontSize: '0.68rem',
+    fontWeight: '700',
+    color: '#6B4FBB',
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: '0.25rem',
+    cursor: 'pointer',
+    transition: 'all 0.15s ease',
+  },
   messageList: {
     flex: 1,
     overflowY: 'auto',
-    padding: '1.5rem',
+    padding: '1.25rem',
     display: 'flex',
     flexDirection: 'column',
-    gap: '1.25rem',
+    gap: '1.15rem',
   },
   inputBar: {
     display: 'flex',
     alignItems: 'center',
     gap: '0.75rem',
-    padding: '1rem 1.5rem',
+    padding: '0.85rem 1.25rem',
     background: 'var(--cream-card)',
     borderTop: '1px solid var(--border)',
     flexShrink: 0,
+  },
+  micBtn: {
+    width: '46px',
+    height: '46px',
+    borderRadius: '50%',
+    flexShrink: 0,
+    border: 'none',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    transition: 'all 0.2s ease',
+  },
+  recordingBanner: {
+    background: '#D32F2F',
+    color: '#fff',
+    padding: '0.45rem 1.25rem',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontSize: '0.8rem',
+    animation: 'fadeIn 0.2s ease',
+  },
+  recDot: {
+    width: '8px',
+    height: '8px',
+    borderRadius: '50%',
+    background: '#fff',
+    animation: 'rec-pulse 1s infinite',
+  },
+  errorBanner: {
+    background: 'var(--peach-bg)',
+    border: '1px solid var(--peach)',
+    borderRadius: 'var(--r-md)',
+    padding: '0.65rem 0.9rem',
+    fontSize: '0.84rem',
+    color: '#B04A37',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: '0.5rem',
+  },
+  closeError: {
+    background: 'none',
+    border: 'none',
+    cursor: 'pointer',
+    color: '#B04A37',
+    fontSize: '1.1rem',
+    marginLeft: 'auto',
   },
   emptyState: {
     height: 'calc(100vh - 61px)',
