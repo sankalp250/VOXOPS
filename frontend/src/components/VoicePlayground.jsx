@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Mic, MicOff, Send, Trash2, Bot, User, Loader2, Volume2, VolumeX, RefreshCw } from 'lucide-react';
-import { runAgentTurn, transcribeAudio } from '../services/api';
+import { runAgentTurn, transcribeAudio, synthesizeSpeech } from '../services/api';
 
 /* ─── helpers ─── */
 function formatTime(d = new Date()) {
@@ -18,6 +18,7 @@ export default function VoicePlayground({ activeClient }) {
   const bottomRef    = useRef(null);
   const recorderRef  = useRef(null);
   const chunksRef    = useRef([]);
+  const audioRef     = useRef(null);  // currently playing TTS audio element
 
   /* seed greeting when client changes */
   useEffect(() => {
@@ -60,11 +61,15 @@ export default function VoicePlayground({ activeClient }) {
       };
       setMessages(prev => [...prev, asstMsg]);
 
-      /* speak via browser TTS if not muted */
-      if (!muted && res.response_text && window.speechSynthesis) {
-        window.speechSynthesis.cancel();
-        const u = new SpeechSynthesisUtterance(res.response_text);
-        window.speechSynthesis.speak(u);
+      /* speak via backend TTS (Deepgram Aura / Sarvam Bulbul) */
+      if (!muted && res.response_text) {
+        // Stop any currently playing audio before starting new
+        if (audioRef.current) {
+          audioRef.current.pause();
+          audioRef.current = null;
+        }
+        const lang = activeClient?.language_code || 'en';
+        audioRef.current = await synthesizeSpeech(res.response_text, lang);
       }
     } catch (err) {
       setError(err.message);
@@ -119,7 +124,11 @@ export default function VoicePlayground({ activeClient }) {
       time: formatTime(),
     }]);
     setError(null);
-    window.speechSynthesis?.cancel();
+    // Stop any ongoing TTS audio on conversation clear
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
   }
 
   /* ─── empty state ─── */
@@ -152,7 +161,16 @@ export default function VoicePlayground({ activeClient }) {
         <div style={{ display: 'flex', gap: '0.5rem' }}>
           <button
             className="btn btn-outline btn-sm"
-            onClick={() => setMuted(m => !m)}
+            onClick={() => {
+              setMuted(m => {
+                const next = !m;
+                if (next && audioRef.current) {
+                  audioRef.current.pause();
+                  audioRef.current = null;
+                }
+                return next;
+              });
+            }}
             title={muted ? 'Unmute agent voice' : 'Mute agent voice'}
           >
             {muted ? <VolumeX size={14} /> : <Volume2 size={14} />}

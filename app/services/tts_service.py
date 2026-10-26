@@ -33,44 +33,63 @@ class MultiProviderTTSService:
         self._sarvam_key = settings.SARVAM_API_KEY
         self._elevenlabs_key = settings.ELEVENLABS_API_KEY
 
+    # Sarvam voice map: language prefix -> (speaker, model)
+    _SARVAM_VOICES: Dict[str, Tuple[str, str]] = {
+        "en":  ("simran_en_conversation", "bulbul:v2"),
+        "hi":  ("ritu_hi_conversation",   "bulbul:v2"),
+        "ta":  ("gokul_ta_narration",     "bulbul:v2"),
+        "te":  ("kavitha_te_conversation","bulbul:v2"),
+        "kn":  ("chaitra_kn_conversation","bulbul:v2"),
+        "bn":  ("arnab_bn_conversation",  "bulbul:v2"),
+        "mr":  ("nilesh_mr_conversation", "bulbul:v2"),
+        "gu":  ("bhavik_gu_conversation", "bulbul:v2"),
+        "pa":  ("anand_pa_conversation",  "bulbul:v2"),
+        "ml":  ("anushka",               "bulbul:v2"),
+    }
+
     async def synthesize_sarvam(
         self,
         text: str,
-        language_code: str = "hi-IN",
-        speaker: str = "meera",
+        language_code: str = "en",
+        speaker: Optional[str] = None,
     ) -> bytes:
         """
-        Synthesize speech using Sarvam Bulbul TTS API.
+        Synthesize speech using Sarvam Bulbul v2 TTS API.
+        Automatically selects the correct speaker for the given language.
         """
         if not self._sarvam_key:
             raise TTSServiceError("SARVAM_API_KEY is not configured in .env")
 
-        lang = language_code if "-" in language_code else f"{language_code}-IN"
+        lang_prefix = language_code.split("-")[0].lower()
+        lang_bcp47  = language_code if "-" in language_code else f"{lang_prefix}-IN"
+        default_speaker, model = self._SARVAM_VOICES.get(lang_prefix, ("anushka", "bulbul:v2"))
+        chosen_speaker = speaker or default_speaker
+
         headers = {
             "api-subscription-key": self._sarvam_key,
             "Content-Type": "application/json",
         }
         payload = {
-            "inputs": [text],
-            "target_language_code": lang,
-            "speaker": speaker,
+            "inputs": [text[:500]],  # Sarvam max ~500 chars per call
+            "target_language_code": lang_bcp47,
+            "speaker": chosen_speaker,
             "pitch": 0,
-            "pace": 1.0,
+            "pace": 1.05,
             "loudness": 1.5,
-            "speech_sample_rate": 8000,
+            "speech_sample_rate": 22050,
             "enable_preprocessing": True,
-            "model": "bulbul:v1",
+            "model": model,
         }
 
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=20.0) as client:
                 resp = await client.post("https://api.sarvam.ai/text-to-speech", headers=headers, json=payload)
             if resp.status_code == 200:
                 data = resp.json()
                 audios = data.get("audios", [])
                 if audios:
                     return base64.b64decode(audios[0])
-            raise TTSServiceError(f"Sarvam TTS HTTP {resp.status_code}: {resp.text}")
+            raise TTSServiceError(f"Sarvam TTS HTTP {resp.status_code}: {resp.text[:300]}")
         except TTSServiceError:
             raise
         except Exception as e:
@@ -83,9 +102,15 @@ class MultiProviderTTSService:
     ) -> bytes:
         """
         Synthesize speech using ElevenLabs Turbo v2.5.
+        Requires a valid sk_... API key from elevenlabs.io/app/settings/api-keys
         """
         if not self._elevenlabs_key:
             raise TTSServiceError("ELEVENLABS_API_KEY is not configured in .env")
+        if not self._elevenlabs_key.startswith("sk_"):
+            raise TTSServiceError(
+                "ELEVENLABS_API_KEY looks invalid — it must start with 'sk_'. "
+                "Generate a real key at elevenlabs.io/app/settings/api-keys"
+            )
 
         headers = {
             "xi-api-key": self._elevenlabs_key,
@@ -103,11 +128,41 @@ class MultiProviderTTSService:
                 resp = await client.post(url, headers=headers, json=payload)
             if resp.status_code == 200:
                 return resp.content
-            raise TTSServiceError(f"ElevenLabs HTTP {resp.status_code}: {resp.text}")
+            raise TTSServiceError(f"ElevenLabs HTTP {resp.status_code}: {resp.text[:300]}")
         except TTSServiceError:
             raise
         except Exception as e:
             raise TTSServiceError(f"ElevenLabs TTS error: {e}") from e
+
+    async def synthesize_deepgram(
+        self,
+        text: str,
+        model: str = "aura-asteria-en",
+    ) -> bytes:
+        """
+        Synthesize speech using Deepgram Aura TTS.
+        Ultra-fast, natural English voice. Uses DEEPGRAM_API_KEY.
+        """
+        from app.core.config import settings as _s
+        key = getattr(_s, "DEEPGRAM_API_KEY", None)
+        if not key:
+            raise TTSServiceError("DEEPGRAM_API_KEY is not configured in .env")
+
+        url = f"https://api.deepgram.com/v1/speak?model={model}"
+        headers = {
+            "Authorization": f"Token {key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(url, headers=headers, json={"text": text})
+            if resp.status_code == 200:
+                return resp.content
+            raise TTSServiceError(f"Deepgram TTS HTTP {resp.status_code}: {resp.text[:300]}")
+        except TTSServiceError:
+            raise
+        except Exception as e:
+            raise TTSServiceError(f"Deepgram TTS error: {e}") from e
 
     def synthesize_mock_wav(self, text: str) -> bytes:
         """
@@ -144,15 +199,26 @@ class MultiProviderTTSService:
         is_indian = language_code.split("-")[0].lower() in _indian_langs
 
         # Determine priority chain
+        # Indian languages: Sarvam first (best quality for IN langs)
+        # English: Deepgram Aura (fastest) → Sarvam EN → ElevenLabs (needs valid sk_ key)
         if preferred_provider == "sarvam" or (preferred_provider == "auto" and is_indian):
             providers = [
-                ("sarvam", lambda: self.synthesize_sarvam(clean_text, language_code)),
-                ("elevenlabs", lambda: self.synthesize_elevenlabs(clean_text)),
+                ("sarvam",    lambda: self.synthesize_sarvam(clean_text, language_code)),
+                ("deepgram",  lambda: self.synthesize_deepgram(clean_text)),
+                ("elevenlabs",lambda: self.synthesize_elevenlabs(clean_text)),
+            ]
+        elif preferred_provider == "elevenlabs":
+            providers = [
+                ("elevenlabs",lambda: self.synthesize_elevenlabs(clean_text)),
+                ("deepgram",  lambda: self.synthesize_deepgram(clean_text)),
+                ("sarvam",    lambda: self.synthesize_sarvam(clean_text, language_code)),
             ]
         else:
+            # Default English path: Deepgram Aura is fast & free with your $200 credit
             providers = [
-                ("elevenlabs", lambda: self.synthesize_elevenlabs(clean_text)),
-                ("sarvam", lambda: self.synthesize_sarvam(clean_text, language_code)),
+                ("deepgram",  lambda: self.synthesize_deepgram(clean_text)),
+                ("sarvam",    lambda: self.synthesize_sarvam(clean_text, language_code)),
+                ("elevenlabs",lambda: self.synthesize_elevenlabs(clean_text)),
             ]
 
         for name, fn in providers:

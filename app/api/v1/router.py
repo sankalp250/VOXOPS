@@ -1,13 +1,14 @@
 from fastapi import APIRouter
-from app.api.v1.endpoints import health, audio, clients, memory, websockets, stream
+from app.api.v1.endpoints import health, audio, tts, clients, memory, websockets, stream
 
 api_router = APIRouter()
 
 # System
 api_router.include_router(health.router, tags=["System Health"])
 
-# Audio & STT
+# Audio — STT (transcription) + TTS (synthesis)
 api_router.include_router(audio.router, prefix="/audio", tags=["Audio & STT Engine"])
+api_router.include_router(tts.router, prefix="/audio", tags=["Audio & TTS Engine"])
 
 # Vector Memory & Semantic Search (Phase 5)
 api_router.include_router(memory.router, prefix="/memory", tags=["Vector Memory & RAG"])

@@ -141,3 +141,45 @@ export async function checkSystemHealth() {
     return { status: 'offline', error: err.message };
   }
 }
+
+/**
+ * Calls the backend TTS engine (Deepgram Aura / Sarvam Bulbul / ElevenLabs) and plays
+ * the returned audio. Falls back to browser speech synthesis only when the backend is offline.
+ *
+ * @param {string} text          - Text to speak
+ * @param {string} languageCode  - ISO language code (en, hi, ta, …)
+ * @returns {Promise<HTMLAudioElement|null>} The playing Audio element, or null on failure
+ */
+export async function synthesizeSpeech(text, languageCode = 'en') {
+  if (!text || !text.trim()) return null;
+
+  try {
+    const res = await fetch(`${API_BASE}/audio/synthesize`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: text.trim(),
+        language_code: languageCode,
+        preferred_provider: 'auto',
+      }),
+    });
+
+    if (!res.ok) throw new Error(`TTS backend error ${res.status}`);
+
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audio.onended = () => URL.revokeObjectURL(url);
+    await audio.play();
+    return audio;
+  } catch (err) {
+    console.warn('[TTS] Backend TTS failed, falling back to browser synthesis:', err.message);
+    // Graceful degradation: use browser voice so the UI is never silent
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      window.speechSynthesis.speak(u);
+    }
+    return null;
+  }
+}
