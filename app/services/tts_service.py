@@ -98,7 +98,7 @@ class MultiProviderTTSService:
     async def synthesize_elevenlabs(
         self,
         text: str,
-        voice_id: str = "21m00Tcm4TlvDq8ikWAM",  # Rachel voice
+        voice_id: str = "cgSgspJ2msm6clMCkdW9",  # Jessica - Playful, Bright, Warm (free premade)
     ) -> bytes:
         """
         Synthesize speech using ElevenLabs Turbo v2.5.
@@ -214,11 +214,12 @@ class MultiProviderTTSService:
                 ("sarvam",    lambda: self.synthesize_sarvam(clean_text, language_code)),
             ]
         else:
-            # Default English path: Deepgram Aura is fast & free with your $200 credit
+            # English path: ElevenLabs first (premium voice, free premade voices work)
+            # then Deepgram Aura, then Sarvam EN as final fallback
             providers = [
+                ("elevenlabs",lambda: self.synthesize_elevenlabs(clean_text)),
                 ("deepgram",  lambda: self.synthesize_deepgram(clean_text)),
                 ("sarvam",    lambda: self.synthesize_sarvam(clean_text, language_code)),
-                ("elevenlabs",lambda: self.synthesize_elevenlabs(clean_text)),
             ]
 
         for name, fn in providers:
