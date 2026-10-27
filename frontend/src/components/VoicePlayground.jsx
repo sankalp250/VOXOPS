@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Mic, MicOff, Send, Trash2, Bot, User, Loader2, Volume2, VolumeX, RefreshCw, Radio, Sparkles } from 'lucide-react';
+import { Mic, MicOff, Send, Trash2, Bot, User, Loader2, Volume2, VolumeX, RefreshCw, Radio, Sparkles, CheckCircle2 } from 'lucide-react';
 import { runAgentTurn, transcribeAudio, synthesizeSpeech } from '../services/api';
 
 /* ─── helpers ─── */
@@ -18,6 +18,7 @@ export default function VoicePlayground({ activeClient, activeVoice, onNavigateT
   const [input, setInput] = useState('');
   const [recording, setRecording] = useState(false);
   const [recordSeconds, setRecordSeconds] = useState(0);
+  const [audioLevel, setAudioLevel] = useState(0); // 0 to 100 for visualizer
   const [thinking, setThinking] = useState(false);
   const [muted, setMuted] = useState(false);
   const [continuousMode, setContinuousMode] = useState(false);
@@ -31,7 +32,13 @@ export default function VoicePlayground({ activeClient, activeVoice, onNavigateT
   const timerIntervalRef = useRef(null);
   const recStartTimeRef = useRef(0);
 
-  // Sync refs for event handlers and speech synthesis onended
+  // AudioContext & VAD (Voice Activity Detection) refs
+  const audioContextRef = useRef(null);
+  const vadAnimFrameRef = useRef(null);
+  const hasSpokenRef = useRef(false);
+  const lastSpokenTimeRef = useRef(0);
+
+  // State synchronization refs for event listeners and callbacks
   const continuousRef = useRef(continuousMode);
   continuousRef.current = continuousMode;
   const mutedRef = useRef(muted);
@@ -67,9 +74,26 @@ export default function VoicePlayground({ activeClient, activeVoice, onNavigateT
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, thinking, recording]);
 
+  /* clean up on unmount */
+  useEffect(() => {
+    return () => {
+      clearInterval(timerIntervalRef.current);
+      if (vadAnimFrameRef.current) cancelAnimationFrame(vadAnimFrameRef.current);
+      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+        audioContextRef.current.close().catch(() => {});
+      }
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current = null;
+      }
+    };
+  }, []);
+
   /* send a text turn with multi-turn conversation context */
-  const send = useCallback(async (text) => {
-    if (!text.trim() || !activeClient || thinkingRef.current) return;
+  const send = useCallback(async (text, isVoice = false) => {
+    if (!text || !text.trim() || !activeClient) return;
+    // Guard against duplicate submission from text box, but allow voice callbacks through
+    if (!isVoice && thinkingRef.current) return;
 
     const userMsg = { id: Date.now(), role: 'user', text, time: formatTime() };
     setMessages(prev => [...prev, userMsg]);
@@ -139,12 +163,17 @@ export default function VoicePlayground({ activeClient, activeVoice, onNavigateT
     }
   }, [activeClient, effectiveVoice, messages, sessionId]);
 
-  /* mic recording start */
+  /* mic recording start with VAD (auto-stop on silence) */
   async function startRec() {
+    if (recordingRef.current || thinkingRef.current) return;
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const recorder = new MediaRecorder(stream);
       chunksRef.current = [];
+      hasSpokenRef.current = false;
+      lastSpokenTimeRef.current = Date.now();
+
       recorder.ondataavailable = e => {
         if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
       };
@@ -152,10 +181,15 @@ export default function VoicePlayground({ activeClient, activeVoice, onNavigateT
       recorder.onstop = async () => {
         stream.getTracks().forEach(t => t.stop());
         clearInterval(timerIntervalRef.current);
+        if (vadAnimFrameRef.current) cancelAnimationFrame(vadAnimFrameRef.current);
+        if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+          audioContextRef.current.close().catch(() => {});
+        }
+        setAudioLevel(0);
 
         const duration = Date.now() - recStartTimeRef.current;
         if (duration < 400) {
-          setError('Recording was too short. Click once to start, speak clearly, then click again to finish.');
+          setError('Recording was too short. Speak clearly, then click Done or pause speaking.');
           setRecording(false);
           return;
         }
@@ -165,9 +199,10 @@ export default function VoicePlayground({ activeClient, activeVoice, onNavigateT
         try {
           const { transcript } = await transcribeAudio(blob, activeClient?.language_code || 'en');
           if (transcript?.trim() && !transcript.startsWith('[Transcription unavailable')) {
-            await send(transcript);
+            // Force execution with isVoice=true so thinkingRef doesn't drop it
+            await send(transcript, true);
           } else {
-            setError('Could not clearly transcribe speech. Please try speaking again.');
+            setError('Could not clearly hear speech. Please try speaking again.');
           }
         } catch (e) {
           setError(e.message);
@@ -176,6 +211,50 @@ export default function VoicePlayground({ activeClient, activeVoice, onNavigateT
           setRecording(false);
         }
       };
+
+      // Set up Web Audio Analyser for VAD & volume meter
+      try {
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        audioContextRef.current = audioCtx;
+        const source = audioCtx.createMediaStreamSource(stream);
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        source.connect(analyser);
+
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+        const checkAudioLevels = () => {
+          if (!recordingRef.current) return;
+          analyser.getByteFrequencyData(dataArray);
+
+          // Calculate average volume
+          let sum = 0;
+          for (let i = 0; i < dataArray.length; i++) {
+            sum += dataArray[i];
+          }
+          const avg = sum / dataArray.length;
+          setAudioLevel(Math.min(100, Math.round((avg / 128) * 100)));
+
+          // Speech threshold
+          if (avg > 12) {
+            hasSpokenRef.current = true;
+            lastSpokenTimeRef.current = Date.now();
+          } else if (hasSpokenRef.current) {
+            // If user has spoken and 1.8 seconds of silence has passed, auto-stop!
+            const silenceDuration = Date.now() - lastSpokenTimeRef.current;
+            if (silenceDuration > 1800) {
+              stopRec();
+              return;
+            }
+          }
+
+          vadAnimFrameRef.current = requestAnimationFrame(checkAudioLevels);
+        };
+
+        vadAnimFrameRef.current = requestAnimationFrame(checkAudioLevels);
+      } catch (err) {
+        console.warn('VAD AudioContext not supported:', err);
+      }
 
       recStartTimeRef.current = Date.now();
       setRecordSeconds(0);
@@ -194,8 +273,15 @@ export default function VoicePlayground({ activeClient, activeVoice, onNavigateT
 
   /* mic recording stop */
   function stopRec() {
+    if (vadAnimFrameRef.current) {
+      cancelAnimationFrame(vadAnimFrameRef.current);
+    }
     if (recorderRef.current && recorderRef.current.state !== 'inactive') {
-      recorderRef.current.stop();
+      try {
+        recorderRef.current.stop();
+      } catch {
+        // ignore
+      }
     }
     clearInterval(timerIntervalRef.current);
     setRecording(false);
@@ -262,7 +348,7 @@ export default function VoicePlayground({ activeClient, activeVoice, onNavigateT
               <span className="dot-live" />
               <span>Live · {activeClient.language_code?.toUpperCase()}</span>
               <span>·</span>
-              <span>Context: Multi-turn Active</span>
+              <span>Multi-turn Context Active</span>
             </div>
           </div>
         </div>
@@ -353,6 +439,7 @@ export default function VoicePlayground({ activeClient, activeVoice, onNavigateT
               {[0, 150, 300].map(d => (
                 <div key={d} style={{ width: '6px', height: '6px', borderRadius: '50%', background: 'var(--ink-light)', animation: `pulse-dot 1.2s ease-in-out ${d}ms infinite` }} />
               ))}
+              <span style={{ fontSize: '0.78rem', color: 'var(--ink-muted)', marginLeft: '0.4rem' }}>{activeClient.name} is thinking...</span>
             </div>
           </div>
         )}
@@ -368,14 +455,39 @@ export default function VoicePlayground({ activeClient, activeVoice, onNavigateT
         <div ref={bottomRef} />
       </div>
 
-      {/* ── Recording Live Status Pill ───────────────────── */}
+      {/* ── Recording Live Status Bar with VAD & Stop Action ── */}
       {recording && (
         <div style={styles.recordingBanner}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
             <span style={styles.recDot} />
-            <span style={{ fontWeight: '700', fontSize: '0.85rem' }}>Listening... ({formatDuration(recordSeconds)})</span>
-            <span style={{ fontSize: '0.75rem', opacity: 0.85 }}>Click the red button when done speaking</span>
+            <span style={{ fontWeight: '700', fontSize: '0.86rem' }}>
+              Listening... ({formatDuration(recordSeconds)})
+            </span>
+            {/* Live Audio Visualizer Bars */}
+            <div style={styles.waveBarBox}>
+              {[0.4, 0.8, 1.2, 0.6, 0.9, 0.3].map((f, i) => (
+                <div
+                  key={i}
+                  style={{
+                    ...styles.waveBar,
+                    height: `${Math.max(4, Math.min(22, (audioLevel * f) / 3.5))}px`,
+                  }}
+                />
+              ))}
+            </div>
+            <span style={{ fontSize: '0.75rem', opacity: 0.9, marginLeft: '0.2rem' }}>
+              Pause speaking to auto-send, or click:
+            </span>
           </div>
+
+          <button
+            type="button"
+            onClick={stopRec}
+            style={styles.doneSpeakingBtn}
+            title="Click to finish speaking and send to agent"
+          >
+            <CheckCircle2 size={14} /> Done Speaking ➔
+          </button>
         </div>
       )}
 
@@ -386,7 +498,7 @@ export default function VoicePlayground({ activeClient, activeVoice, onNavigateT
           type="button"
           onClick={toggleRecording}
           disabled={thinking}
-          title={recording ? 'Click to stop and send voice' : 'Click once to start speaking'}
+          title={recording ? 'Click to finish speaking and send' : 'Click to start speaking'}
           style={{
             ...styles.micBtn,
             background: recording ? '#D32F2F' : 'var(--ink)',
@@ -404,7 +516,7 @@ export default function VoicePlayground({ activeClient, activeVoice, onNavigateT
         >
           <input
             className="input"
-            placeholder={recording ? '🎤 Recording in progress... click mic to finish' : `Message ${activeClient.name}...`}
+            placeholder={recording ? '🎤 Listening... pause speaking or click "Done Speaking"' : `Message ${activeClient.name}...`}
             value={input}
             onChange={e => setInput(e.target.value)}
             disabled={thinking || recording}
@@ -434,7 +546,7 @@ export default function VoicePlayground({ activeClient, activeVoice, onNavigateT
       <style>{`
         @keyframes spin { to { transform: rotate(360deg); } }
         @keyframes pulse-dot { 0%, 100% { opacity: 0.3; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1.2); } }
-        @keyframes rec-pulse { 0% { transform: scale(0.95); opacity: 0.7; } 50% { transform: scale(1.2); opacity: 1; } 100% { transform: scale(0.95); opacity: 0.7; } }
+        @keyframes rec-pulse { 0% { transform: scale(0.95); opacity: 0.7; } 50% { transform: scale(1.25); opacity: 1; } 100% { transform: scale(0.95); opacity: 0.7; } }
       `}</style>
     </div>
   );
@@ -518,19 +630,47 @@ const styles = {
   recordingBanner: {
     background: '#D32F2F',
     color: '#fff',
-    padding: '0.45rem 1.25rem',
+    padding: '0.5rem 1.25rem',
     display: 'flex',
     alignItems: 'center',
-    justifyContent: 'center',
-    fontSize: '0.8rem',
+    justifyContent: 'space-between',
+    fontSize: '0.82rem',
     animation: 'fadeIn 0.2s ease',
   },
   recDot: {
-    width: '8px',
-    height: '8px',
+    width: '9px',
+    height: '9px',
     borderRadius: '50%',
     background: '#fff',
     animation: 'rec-pulse 1s infinite',
+  },
+  waveBarBox: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: '2px',
+    height: '24px',
+    padding: '0 4px',
+  },
+  waveBar: {
+    width: '3px',
+    background: '#fff',
+    borderRadius: '2px',
+    transition: 'height 0.08s ease',
+  },
+  doneSpeakingBtn: {
+    background: '#fff',
+    color: '#D32F2F',
+    border: 'none',
+    borderRadius: 'var(--r-pill)',
+    padding: '0.35rem 0.85rem',
+    fontSize: '0.78rem',
+    fontWeight: '700',
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: '0.35rem',
+    cursor: 'pointer',
+    boxShadow: '0 2px 4px rgba(0,0,0,0.15)',
+    transition: 'transform 0.1s ease',
   },
   errorBanner: {
     background: 'var(--peach-bg)',
